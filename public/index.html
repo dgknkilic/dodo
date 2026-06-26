@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dodo</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+
+<!-- Giriş Ekranı -->
+<div id="login-view">
+  <div class="auth-box">
+    <div class="auth-logo">🐦 Dodo</div>
+    <div class="auth-tabs">
+      <button class="auth-tab active" data-tab="login">Giriş Yap</button>
+      <button class="auth-tab" data-tab="register">Kayıt Ol</button>
+    </div>
+    <form id="auth-form">
+      <input id="auth-username" type="text" placeholder="Kullanıcı adı" autocomplete="username" required />
+      <input id="auth-password" type="password" placeholder="Şifre" autocomplete="current-password" required />
+      <button type="submit" id="auth-submit">Giriş Yap</button>
+      <p id="auth-error"></p>
+    </form>
+  </div>
+</div>
+
+<!-- Ana Uygulama -->
+<div id="app-view" class="hidden">
+  <div class="layout">
+
+    <!-- Sol Kenar Çubuğu -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <span class="app-name">🐦 Dodo</span>
+      </div>
+
+      <div class="channel-list" id="channel-list">
+        <div class="channel-section-header">METİN KANALLARI</div>
+        <div id="text-channels"></div>
+        <div class="channel-section-header" style="margin-top:16px">SESLİ KANALLAR</div>
+        <div id="voice-channels"></div>
+      </div>
+
+      <!-- Aktif sesli oda bar (sesli kanalda olunca gösterilir) -->
+      <div id="voice-bar" class="voice-bar hidden">
+        <div class="voice-bar-info">
+          <span class="voice-bar-status">🔊 Ses bağlı</span>
+          <span id="voice-bar-channel"></span>
+        </div>
+        <div class="voice-bar-controls">
+          <button id="vbar-mute" class="vbar-btn" title="Mikrofon">🎤</button>
+          <button id="vbar-screen" class="vbar-btn" title="Ekran paylaş">🖥️</button>
+          <button id="vbar-leave" class="vbar-btn danger" title="Kanaldan ayrıl">📞</button>
+        </div>
+      </div>
+
+      <div class="user-bar">
+        <div class="user-avatar" id="user-avatar"></div>
+        <span class="user-name" id="user-name"></span>
+        <button class="logout-btn" id="logout-btn" title="Çıkış">⏻</button>
+      </div>
+    </aside>
+
+    <!-- Ana İçerik -->
+    <main class="main-content">
+
+      <!-- Karşılama -->
+      <div id="welcome-view" class="view">
+        <div class="welcome">
+          <div class="welcome-icon">🐦</div>
+          <h2>Dodo'ya Hoş Geldin!</h2>
+          <p>Sol kenar çubuğundan bir kanal seç</p>
+        </div>
+      </div>
+
+      <!-- Metin Kanalı -->
+      <div id="text-view" class="view hidden">
+        <div class="view-header">
+          <span class="view-header-icon">#</span>
+          <span id="text-channel-name"></span>
+        </div>
+        <div id="messages" class="messages"></div>
+        <div class="message-input-row">
+          <input id="message-input" type="text" placeholder="Mesaj yaz..." maxlength="2000" autocomplete="off" />
+          <button id="send-btn">Gönder</button>
+        </div>
+      </div>
+
+      <!-- Sesli Kanal -->
+      <div id="voice-view" class="view hidden">
+        <div class="view-header">
+          <span class="view-header-icon">🔊</span>
+          <span id="voice-channel-name"></span>
+        </div>
+
+        <!-- Ekran paylaşım videoları -->
+        <div id="screen-shares" class="screen-shares hidden"></div>
+
+        <!-- Katılımcılar -->
+        <div id="voice-participants" class="voice-participants"></div>
+
+        <!-- Katıl butonu (henüz katılmadıysan) -->
+        <div id="join-voice-area" class="join-voice-area">
+          <button id="join-voice-btn" class="join-btn">🎤 Sese Katıl</button>
+        </div>
+
+        <!-- Sesli kontroller (katıldıktan sonra) -->
+        <div id="voice-controls" class="voice-controls hidden">
+          <button id="mute-btn" class="ctrl-btn active" title="Mikrofonu sessize al">
+            <span class="btn-icon">🎤</span>
+            <span class="btn-label">Sessize Al</span>
+          </button>
+          <button id="screen-btn" class="ctrl-btn" title="Ekran paylaş">
+            <span class="btn-icon">🖥️</span>
+            <span class="btn-label">Ekran Paylaş</span>
+          </button>
+          <button id="leave-btn" class="ctrl-btn leave" title="Kanaldan ayrıl">
+            <span class="btn-icon">📞</span>
+            <span class="btn-label">Ayrıl</span>
+          </button>
+        </div>
+      </div>
+
+    </main>
+  </div>
+</div>
+
+<!-- Gizli ses elementleri için container -->
+<div id="audio-container" style="display:none"></div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/webrtc.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
