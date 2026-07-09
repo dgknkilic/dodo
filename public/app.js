@@ -22,6 +22,22 @@ let pendingMoveSocketId = null;
 let pendingAvatarDataUrl = undefined;
 let searchActive = false;
 let allMessages = [];           // for search
+let audioSettings = loadAudioSettings();
+let volumePopoverTarget = null; // { type: 'self'|'user', socketId, uname }
+
+function loadAudioSettings() {
+  try {
+    const raw = localStorage.getItem('audioSettings');
+    const parsed = raw ? JSON.parse(raw) : {};
+    return { mic: parsed.mic ?? 100, master: parsed.master ?? 100, perUser: parsed.perUser || {} };
+  } catch (e) {
+    return { mic: 100, master: 100, perUser: {} };
+  }
+}
+
+function saveAudioSettings() {
+  localStorage.setItem('audioSettings', JSON.stringify(audioSettings));
+}
 
 if (token && username) {
   showApp();
@@ -112,6 +128,8 @@ async function initApp() {
   webrtc = new WebRTCManager(socket);
   webrtc.onParticipantJoined = (socketId, uname, avatar) => {
     voiceParticipants[socketId] = { username: uname, avatar: avatar || null };
+    const savedVol = audioSettings.perUser[uname];
+    if (savedVol !== undefined) webrtc.setPeerVolume(socketId, savedVol);
     renderVoiceParticipants();
   };
   webrtc.onParticipantLeft = (socketId) => {
@@ -590,22 +608,22 @@ function renderVoiceParticipantsFromState(channelId) {
     const sid = typeof m === 'string' ? `state-${m}` : m.socketId;
     const uname = typeof m === 'string' ? m : m.username;
     const avatar = typeof m === 'object' ? m.avatar : null;
-    container.appendChild(createParticipantEl(sid, uname, avatar, false, false));
+    container.appendChild(createParticipantEl(sid, uname, avatar, false, false, false));
   });
 }
 
 function renderVoiceParticipants() {
   const container = document.getElementById('voice-participants');
   container.innerHTML = '';
-  container.appendChild(createParticipantEl('me', username, myAvatar, webrtc?.isMuted, webrtc?.isSharing));
+  container.appendChild(createParticipantEl('me', username, myAvatar, webrtc?.isMuted, webrtc?.isSharing, true));
   Object.entries(voiceParticipants).forEach(([socketId, data]) => {
     const uname = typeof data === 'string' ? data : data.username;
     const avatar = typeof data === 'object' ? data.avatar : null;
-    container.appendChild(createParticipantEl(socketId, uname, avatar, mutedUsers[socketId], sharingUsers[socketId]));
+    container.appendChild(createParticipantEl(socketId, uname, avatar, mutedUsers[socketId], sharingUsers[socketId], true));
   });
 }
 
-function createParticipantEl(socketId, uname, avatar, muted, sharing) {
+function createParticipantEl(socketId, uname, avatar, muted, sharing, interactive) {
   const el = document.createElement('div');
   el.className = 'voice-participant';
   el.id = `vp-${socketId}`;
@@ -626,6 +644,21 @@ function createParticipantEl(socketId, uname, avatar, muted, sharing) {
 
   el.appendChild(av);
   el.appendChild(name);
+
+  if (interactive) {
+    if (socketId === 'me') {
+      el.classList.add('vp-clickable');
+      el.title = 'Ses ayarların için tıkla';
+      el.addEventListener('click', () => openVolumePopover(el, 'self', 'me', uname, avatar));
+    } else {
+      el.classList.add('vp-clickable');
+      el.title = 'Bu kullanıcının sesini ayarlamak için sağ tıkla';
+      el.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        openVolumePopover(el, 'user', socketId, uname, avatar);
+      });
+    }
+  }
 
   if (isAdmin && socketId !== 'me' && !socketId.startsWith('state-') && uname !== username) {
     const adminBtns = document.createElement('div');
@@ -666,6 +699,8 @@ document.getElementById('join-voice-btn').addEventListener('click', async () => 
   try {
     if (voiceChannelId && voiceChannelId !== currentChannel.id) leaveVoice();
     await webrtc.joinVoice(currentChannel.id);
+    webrtc.setMicVolume(audioSettings.mic);
+    webrtc.setMasterVolume(audioSettings.master);
     voiceChannelId = currentChannel.id;
     voiceChannelName = currentChannel.name;
     voiceParticipants = {};
@@ -712,6 +747,7 @@ document.getElementById('vbar-leave').addEventListener('click', leaveVoice);
 function leaveVoice() {
   if (!webrtc) return;
   webrtc.leaveVoice();
+  closeVolumePopover();
   voiceChannelId = null;
   voiceChannelName = null;
   voiceParticipants = {};
@@ -728,6 +764,88 @@ function leaveVoice() {
   updateVoiceUI();
   if (currentChannel?.type === 'voice') renderVoiceParticipantsFromState(currentChannel.id);
 }
+
+// ============ SES AYARLARI POPOVER ============
+
+function openVolumePopover(anchorEl, type, socketId, uname, avatar) {
+  const pop = document.getElementById('volume-popover');
+  volumePopoverTarget = { type, socketId, uname };
+
+  document.getElementById('vpop-name').textContent = type === 'self' ? `${uname} (Sen)` : uname;
+  setAvatarEl(document.getElementById('vpop-avatar'), uname, avatar, 'vpop-avatar');
+
+  document.getElementById('vpop-mic-row').classList.toggle('hidden', type !== 'self');
+  document.getElementById('vpop-master-row').classList.toggle('hidden', type !== 'self');
+  document.getElementById('vpop-user-row').classList.toggle('hidden', type !== 'user');
+
+  if (type === 'self') {
+    document.getElementById('vpop-mic-slider').value = audioSettings.mic;
+    document.getElementById('vpop-mic-value').textContent = `${audioSettings.mic}%`;
+    document.getElementById('vpop-master-slider').value = audioSettings.master;
+    document.getElementById('vpop-master-value').textContent = `${audioSettings.master}%`;
+  } else {
+    const val = audioSettings.perUser[uname] ?? 100;
+    document.getElementById('vpop-user-label').textContent = `${uname} Sesi`;
+    document.getElementById('vpop-user-slider').value = val;
+    document.getElementById('vpop-user-value').textContent = `${val}%`;
+  }
+
+  pop.classList.remove('hidden');
+  positionVolumePopover(pop, anchorEl);
+}
+
+function positionVolumePopover(pop, anchorEl) {
+  const rect = anchorEl.getBoundingClientRect();
+  const popRect = pop.getBoundingClientRect();
+  let left = rect.left + rect.width / 2 - popRect.width / 2;
+  let top = rect.bottom + 8;
+  left = Math.max(8, Math.min(left, window.innerWidth - popRect.width - 8));
+  if (top + popRect.height > window.innerHeight - 8) top = rect.top - popRect.height - 8;
+  pop.style.left = `${left}px`;
+  pop.style.top = `${top}px`;
+}
+
+function closeVolumePopover() {
+  document.getElementById('volume-popover').classList.add('hidden');
+  volumePopoverTarget = null;
+}
+
+document.getElementById('vpop-mic-slider').addEventListener('input', (e) => {
+  const val = parseInt(e.target.value, 10);
+  document.getElementById('vpop-mic-value').textContent = `${val}%`;
+  audioSettings.mic = val;
+  webrtc?.setMicVolume(val);
+  saveAudioSettings();
+});
+
+document.getElementById('vpop-master-slider').addEventListener('input', (e) => {
+  const val = parseInt(e.target.value, 10);
+  document.getElementById('vpop-master-value').textContent = `${val}%`;
+  audioSettings.master = val;
+  webrtc?.setMasterVolume(val);
+  saveAudioSettings();
+});
+
+document.getElementById('vpop-user-slider').addEventListener('input', (e) => {
+  const val = parseInt(e.target.value, 10);
+  document.getElementById('vpop-user-value').textContent = `${val}%`;
+  if (!volumePopoverTarget || volumePopoverTarget.type !== 'user') return;
+  audioSettings.perUser[volumePopoverTarget.uname] = val;
+  webrtc?.setPeerVolume(volumePopoverTarget.socketId, val);
+  saveAudioSettings();
+});
+
+document.addEventListener('click', (e) => {
+  const pop = document.getElementById('volume-popover');
+  if (pop.classList.contains('hidden')) return;
+  if (pop.contains(e.target)) return;
+  if (e.target.closest('.voice-participant')) return;
+  closeVolumePopover();
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeVolumePopover();
+});
 
 function showVoiceBar(chName) {
   document.getElementById('voice-bar-channel').textContent = chName;

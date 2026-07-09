@@ -220,7 +220,34 @@
   </div>
 </div>
 
-<div id="audio-container" style="display:none"></div>
+<!-- Ses Ayarları Popover -->
+<div id="volume-popover" class="volume-popover hidden">
+  <div class="vpop-header">
+    <div class="vpop-avatar" id="vpop-avatar"></div>
+    <span id="vpop-name"></span>
+  </div>
+  <div id="vpop-mic-row" class="vpop-row hidden">
+    <div class="vpop-row-label">
+      <span>🎙️ Mikrofon Seviyesi</span>
+      <span id="vpop-mic-value">100%</span>
+    </div>
+    <input type="range" id="vpop-mic-slider" class="vpop-slider" min="0" max="200" value="100" />
+  </div>
+  <div id="vpop-master-row" class="vpop-row hidden">
+    <div class="vpop-row-label">
+      <span>🔊 Gelen Ses (Genel)</span>
+      <span id="vpop-master-value">100%</span>
+    </div>
+    <input type="range" id="vpop-master-slider" class="vpop-slider" min="0" max="200" value="100" />
+  </div>
+  <div id="vpop-user-row" class="vpop-row hidden">
+    <div class="vpop-row-label">
+      <span id="vpop-user-label">Kullanıcı Sesi</span>
+      <span id="vpop-user-value">100%</span>
+    </div>
+    <input type="range" id="vpop-user-slider" class="vpop-slider" min="0" max="200" value="100" />
+  </div>
+</div>
 
 <script src="/socket.io/socket.io.js"></script>
 <script src="/webrtc.js"></script>

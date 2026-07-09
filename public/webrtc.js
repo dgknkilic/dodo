@@ -4,11 +4,20 @@ class WebRTCManager {
   constructor(socket) {
     this.socket = socket;
     this.peers = {};           // socketId -> RTCPeerConnection
-    this.localStream = null;   // mikrofon stream
+    this.rawMicStream = null;  // ham mikrofon stream (donanımdan gelen)
+    this.localStream = null;   // kazanç uygulanmış, peer'lara gönderilen stream
     this.screenStream = null;  // ekran paylaşım stream
     this.currentChannel = null;
     this.isMuted = false;
     this.isSharing = false;
+
+    // Web Audio - ses karıştırma/kazanç kontrolü
+    this.audioCtx = null;
+    this.micGainNode = null;
+    this.micVolume = 1;              // 0-2 (0-200%)
+    this.masterVolume = 1;           // 0-2, tüm gelen sesleri etkiler
+    this.peerVolumes = {};           // socketId -> 0-2, kişiye özel ses seviyesi
+    this.peerAudioNodes = {};        // socketId -> { source, gainNode }
 
     // Callbacks (app.js tarafından set edilir)
     this.onParticipantJoined = null;
@@ -27,10 +36,30 @@ class WebRTCManager {
     this._setupSocketListeners();
   }
 
+  // Web Audio bağlamını hazırla (kullanıcı etkileşimi sonrası çağrılmalı)
+  _ensureAudioContext() {
+    if (!this.audioCtx) {
+      this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (this.audioCtx.state === 'suspended') this.audioCtx.resume();
+    return this.audioCtx;
+  }
+
   // Sesli kanala katıl
   async joinVoice(channelId) {
     try {
-      this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      this.rawMicStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      const ctx = this._ensureAudioContext();
+
+      // Mikrofonu kazanç düğümünden geçirip peer'lara o işlenmiş stream'i gönderiyoruz
+      const source = ctx.createMediaStreamSource(this.rawMicStream);
+      this.micGainNode = ctx.createGain();
+      this.micGainNode.gain.value = this.micVolume;
+      const dest = ctx.createMediaStreamDestination();
+      source.connect(this.micGainNode).connect(dest);
+      this._micSource = source;
+      this.localStream = dest.stream;
+
       this.currentChannel = channelId;
       this.socket.emit('join-voice', channelId);
       return true;
@@ -53,7 +82,19 @@ class WebRTCManager {
     Object.values(this.peers).forEach(pc => pc.close());
     this.peers = {};
 
+    // Gelen ses düğümlerini temizle
+    Object.values(this.peerAudioNodes).forEach(({ source, gainNode }) => {
+      try { source.disconnect(); gainNode.disconnect(); } catch (e) {}
+    });
+    this.peerAudioNodes = {};
+
     // Mikrofonu durdur
+    if (this._micSource) { try { this._micSource.disconnect(); } catch (e) {} this._micSource = null; }
+    if (this.micGainNode) { try { this.micGainNode.disconnect(); } catch (e) {} this.micGainNode = null; }
+    if (this.rawMicStream) {
+      this.rawMicStream.getTracks().forEach(t => t.stop());
+      this.rawMicStream = null;
+    }
     if (this.localStream) {
       this.localStream.getTracks().forEach(t => t.stop());
       this.localStream = null;
@@ -65,12 +106,32 @@ class WebRTCManager {
       this.screenStream = null;
     }
 
-    // Ses elementlerini temizle
-    document.querySelectorAll('[data-peer-audio]').forEach(el => el.remove());
-
     this.currentChannel = null;
     this.isMuted = false;
     this.isSharing = false;
+  }
+
+  // Kendi mikrofon ses seviyemi ayarla (0-200)
+  setMicVolume(percent) {
+    this.micVolume = Math.max(0, Math.min(200, percent)) / 100;
+    if (this.micGainNode) this.micGainNode.gain.value = this.micVolume;
+  }
+
+  // Gelen tüm seslerin genel seviyesini ayarla (0-200)
+  setMasterVolume(percent) {
+    this.masterVolume = Math.max(0, Math.min(200, percent)) / 100;
+    Object.entries(this.peerAudioNodes).forEach(([socketId, { gainNode }]) => {
+      const peerVol = this.peerVolumes[socketId] ?? 1;
+      gainNode.gain.value = peerVol * this.masterVolume;
+    });
+  }
+
+  // Belirli bir kullanıcıdan gelen sesin seviyesini ayarla (0-200)
+  setPeerVolume(socketId, percent) {
+    const vol = Math.max(0, Math.min(200, percent)) / 100;
+    this.peerVolumes[socketId] = vol;
+    const node = this.peerAudioNodes[socketId];
+    if (node) node.gainNode.gain.value = vol * this.masterVolume;
   }
 
   // Mikrofon aç/kapat
@@ -155,7 +216,7 @@ class WebRTCManager {
       const stream = event.streams[0];
 
       if (track.kind === 'audio') {
-        this._addAudioElement(socketId, stream);
+        this._playRemoteAudio(socketId, stream);
       } else if (track.kind === 'video') {
         // Ekran paylaşımı
         track.onunmute = () => {
@@ -195,7 +256,7 @@ class WebRTCManager {
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
         delete this.peers[socketId];
-        this._removeAudioElement(socketId);
+        this._stopRemoteAudio(socketId);
       }
     };
 
@@ -256,29 +317,36 @@ class WebRTCManager {
     }
   }
 
-  // Ses elementi ekle
-  _addAudioElement(socketId, stream) {
-    let audio = document.querySelector(`[data-peer-audio="${socketId}"]`);
-    if (!audio) {
-      audio = document.createElement('audio');
-      audio.dataset.peerAudio = socketId;
-      audio.autoplay = true;
-      document.getElementById('audio-container').appendChild(audio);
+  // Gelen sesi Web Audio grafiğine bağla (kişi başı + genel ses kontrolü için)
+  _playRemoteAudio(socketId, stream) {
+    const ctx = this._ensureAudioContext();
+    const existing = this.peerAudioNodes[socketId];
+    if (existing) {
+      try { existing.source.disconnect(); existing.gainNode.disconnect(); } catch (e) {}
     }
-    audio.srcObject = stream;
+    const source = ctx.createMediaStreamSource(stream);
+    const gainNode = ctx.createGain();
+    const peerVol = this.peerVolumes[socketId] ?? 1;
+    gainNode.gain.value = peerVol * this.masterVolume;
+    source.connect(gainNode).connect(ctx.destination);
+    this.peerAudioNodes[socketId] = { source, gainNode };
   }
 
-  _removeAudioElement(socketId) {
-    const audio = document.querySelector(`[data-peer-audio="${socketId}"]`);
-    if (audio) audio.remove();
+  _stopRemoteAudio(socketId) {
+    const node = this.peerAudioNodes[socketId];
+    if (node) {
+      try { node.source.disconnect(); node.gainNode.disconnect(); } catch (e) {}
+      delete this.peerAudioNodes[socketId];
+    }
   }
 
   // Socket olaylarını dinle
   _setupSocketListeners() {
-    // Mevcut katılımcılar listesi geldi - hepsine teklif gönder
+    // Mevcut katılımcılar listesi geldi - hepsine teklif gönder ve arayüze bildir
     this.socket.on('voice-participants', ({ participants }) => {
-      participants.forEach(({ socketId }) => {
+      participants.forEach(({ socketId, username: uname, avatar }) => {
         this._createOffer(socketId);
+        if (this.onParticipantJoined) this.onParticipantJoined(socketId, uname, avatar);
       });
     });
 
@@ -293,7 +361,8 @@ class WebRTCManager {
         this.peers[socketId].close();
         delete this.peers[socketId];
       }
-      this._removeAudioElement(socketId);
+      this._stopRemoteAudio(socketId);
+      delete this.peerVolumes[socketId];
       if (this.onParticipantLeft) this.onParticipantLeft(socketId);
     });
 
