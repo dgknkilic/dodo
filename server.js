@@ -14,7 +14,6 @@ const io = new Server(server);
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'dodo-gizli-anahtar-degistirin';
 
-// Veritabanı kurulumu
 const db = new Database(process.env.DB_PATH || './dodo.db');
 db.pragma('journal_mode = WAL');
 
@@ -23,6 +22,8 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
     password TEXT NOT NULL,
+    avatar TEXT DEFAULT NULL,
+    is_admin INTEGER DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 
@@ -39,13 +40,19 @@ db.exec(`
     channel_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
     content TEXT NOT NULL,
+    reply_to_id INTEGER DEFAULT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(channel_id) REFERENCES channels(id),
     FOREIGN KEY(user_id) REFERENCES users(id)
   );
 `);
 
-// Varsayılan kanalları oluştur
+try { db.exec('ALTER TABLE users ADD COLUMN avatar TEXT DEFAULT NULL'); } catch(e) {}
+try { db.exec('ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0'); } catch(e) {}
+try { db.exec('ALTER TABLE messages ADD COLUMN reply_to_id INTEGER DEFAULT NULL'); } catch(e) {}
+
+db.prepare('UPDATE users SET is_admin=1 WHERE id=(SELECT MIN(id) FROM users) AND (SELECT COUNT(*) FROM users WHERE is_admin=1)=0').run();
+
 const channelCount = db.prepare('SELECT COUNT(*) as cnt FROM channels').get().cnt;
 if (channelCount === 0) {
   const insert = db.prepare('INSERT INTO channels (name, type, position) VALUES (?, ?, ?)');
@@ -55,7 +62,7 @@ if (channelCount === 0) {
   insert.run('ekran-paylaşım', 'voice', 3);
 }
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 function requireAuth(req, res, next) {
@@ -69,27 +76,30 @@ function requireAuth(req, res, next) {
   }
 }
 
-// API rotaları
+function requireAdmin(req, res, next) {
+  const user = db.prepare('SELECT is_admin FROM users WHERE id=?').get(req.user.id);
+  if (!user?.is_admin) return res.status(403).json({ error: 'Yetki gerekli' });
+  next();
+}
+
+// ============ AUTH ============
+
 app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
-  if (!username?.trim() || !password) {
-    return res.status(400).json({ error: 'Kullanıcı adı ve şifre gerekli' });
-  }
+  if (!username?.trim() || !password) return res.status(400).json({ error: 'Kullanıcı adı ve şifre gerekli' });
   const trimmed = username.trim();
-  if (trimmed.length < 2 || trimmed.length > 20) {
-    return res.status(400).json({ error: 'Kullanıcı adı 2-20 karakter olmalı' });
-  }
-  if (password.length < 4) {
-    return res.status(400).json({ error: 'Şifre en az 4 karakter olmalı' });
-  }
+  if (trimmed.length < 2 || trimmed.length > 20) return res.status(400).json({ error: 'Kullanıcı adı 2-20 karakter olmalı' });
+  if (password.length < 4) return res.status(400).json({ error: 'Şifre en az 4 karakter olmalı' });
   try {
     const hash = await bcrypt.hash(password, 10);
     const result = db.prepare('INSERT INTO users (username, password) VALUES (?, ?)').run(trimmed, hash);
-    const token = jwt.sign({ id: result.lastInsertRowid, username: trimmed }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ token, username: trimmed });
+    const userCount = db.prepare('SELECT COUNT(*) as cnt FROM users').get().cnt;
+    if (userCount === 1) db.prepare('UPDATE users SET is_admin=1 WHERE id=?').run(result.lastInsertRowid);
+    const newUser = db.prepare('SELECT is_admin FROM users WHERE id=?').get(result.lastInsertRowid);
+    const token = jwt.sign({ id: result.lastInsertRowid, username: trimmed, is_admin: newUser.is_admin }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token, username: trimmed, is_admin: newUser.is_admin });
   } catch (e) {
     if (e.message.includes('UNIQUE')) return res.status(400).json({ error: 'Bu kullanıcı adı kullanılıyor' });
-    console.error('Kayıt hatası:', e);
     res.status(500).json({ error: 'Sunucu hatası' });
   }
 });
@@ -100,37 +110,106 @@ app.post('/api/login', async (req, res) => {
   if (!user) return res.status(401).json({ error: 'Kullanıcı adı veya şifre hatalı' });
   const valid = await bcrypt.compare(password, user.password);
   if (!valid) return res.status(401).json({ error: 'Kullanıcı adı veya şifre hatalı' });
-  const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
-  res.json({ token, username: user.username });
+  const token = jwt.sign({ id: user.id, username: user.username, is_admin: user.is_admin }, JWT_SECRET, { expiresIn: '30d' });
+  res.json({ token, username: user.username, is_admin: user.is_admin });
 });
+
+app.get('/api/me', requireAuth, (req, res) => {
+  const user = db.prepare('SELECT id, username, avatar, is_admin FROM users WHERE id=?').get(req.user.id);
+  if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
+  res.json(user);
+});
+
+app.put('/api/profile', requireAuth, (req, res) => {
+  const { username, avatar } = req.body;
+  const updates = [], params = [];
+  if (username !== undefined) {
+    const t = username.trim();
+    if (t.length < 2 || t.length > 20) return res.status(400).json({ error: 'Kullanıcı adı 2-20 karakter olmalı' });
+    updates.push('username=?'); params.push(t);
+  }
+  if (avatar !== undefined) {
+    if (avatar !== null && !avatar.startsWith('data:image/')) return res.status(400).json({ error: 'Geçersiz avatar formatı' });
+    updates.push('avatar=?'); params.push(avatar);
+  }
+  if (!updates.length) return res.status(400).json({ error: 'Güncellenecek alan yok' });
+  params.push(req.user.id);
+  try {
+    db.prepare(`UPDATE users SET ${updates.join(',')} WHERE id=?`).run(...params);
+    const user = db.prepare('SELECT id, username, avatar, is_admin FROM users WHERE id=?').get(req.user.id);
+    const newToken = jwt.sign({ id: user.id, username: user.username, is_admin: user.is_admin }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token: newToken, username: user.username, avatar: user.avatar });
+  } catch (e) {
+    if (e.message.includes('UNIQUE')) return res.status(400).json({ error: 'Bu kullanıcı adı kullanılıyor' });
+    res.status(500).json({ error: 'Sunucu hatası' });
+  }
+});
+
+// ============ CHANNELS & MESSAGES ============
 
 app.get('/api/channels', requireAuth, (req, res) => {
-  const channels = db.prepare('SELECT * FROM channels ORDER BY position ASC, type DESC').all();
-  res.json(channels);
+  res.json(db.prepare('SELECT * FROM channels ORDER BY position ASC, type DESC').all());
 });
 
+const MSG_SELECT = `
+  SELECT m.id, m.channel_id, m.content, m.created_at, m.reply_to_id,
+         u.username, u.id as user_id, u.avatar,
+         ru.username as reply_username,
+         rm.content as reply_content
+  FROM messages m
+  JOIN users u ON m.user_id = u.id
+  LEFT JOIN messages rm ON m.reply_to_id = rm.id
+  LEFT JOIN users ru ON rm.user_id = ru.id
+`;
+
 app.get('/api/messages/:channelId', requireAuth, (req, res) => {
-  const messages = db.prepare(`
-    SELECT m.id, m.content, m.created_at, u.username, u.id as user_id
-    FROM messages m
-    JOIN users u ON m.user_id = u.id
-    WHERE m.channel_id = ?
-    ORDER BY m.created_at ASC
-    LIMIT 100
-  `).all(req.params.channelId);
+  const messages = db.prepare(`${MSG_SELECT} WHERE m.channel_id = ? ORDER BY m.created_at ASC LIMIT 100`).all(req.params.channelId);
   res.json(messages);
 });
 
-// Sesli odalar bellekte tutulur (sunucu yeniden başlayınca sıfırlanır)
-// { channelId: { socketId: { username, userId } } }
+// Mesaj sil (admin her mesajı, kullanıcı kendi mesajını silebilir)
+app.delete('/api/messages/:messageId', requireAuth, (req, res) => {
+  const msg = db.prepare('SELECT * FROM messages WHERE id=?').get(req.params.messageId);
+  if (!msg) return res.status(404).json({ error: 'Mesaj bulunamadı' });
+
+  const user = db.prepare('SELECT is_admin FROM users WHERE id=?').get(req.user.id);
+  if (!user?.is_admin && msg.user_id !== req.user.id) {
+    return res.status(403).json({ error: 'Bu mesajı silme yetkiniz yok' });
+  }
+
+  db.prepare('DELETE FROM messages WHERE id=?').run(msg.id);
+  io.to(`text:${msg.channel_id}`).emit('message-deleted', { messageId: msg.id });
+  res.json({ ok: true });
+});
+
+// Kanalı temizle (admin)
+app.delete('/api/channels/:channelId/messages', requireAuth, requireAdmin, (req, res) => {
+  const channelId = req.params.channelId;
+  db.prepare('DELETE FROM messages WHERE channel_id=?').run(channelId);
+  io.to(`text:${channelId}`).emit('channel-cleared', { channelId });
+  res.json({ ok: true });
+});
+
+// Kanal bilgisi (mesaj sayısı, üye sayısı)
+app.get('/api/channels/:channelId/info', requireAuth, (req, res) => {
+  const channelId = req.params.channelId;
+  const msgCount = db.prepare('SELECT COUNT(*) as cnt FROM messages WHERE channel_id=?').get(channelId).cnt;
+  const userCount = db.prepare('SELECT COUNT(DISTINCT user_id) as cnt FROM messages WHERE channel_id=?').get(channelId).cnt;
+  res.json({ message_count: msgCount, user_count: userCount });
+});
+
+// ============ SOCKET ============
+
 const voiceRooms = {};
 
-// Socket.io kimlik doğrulama
 io.use((socket, next) => {
   const token = socket.handshake.auth.token;
   if (!token) return next(new Error('Kimlik doğrulama gerekli'));
   try {
     socket.user = jwt.verify(token, JWT_SECRET);
+    // Avatarı DB'den yükle
+    const u = db.prepare('SELECT avatar FROM users WHERE id=?').get(socket.user.id);
+    socket.user.avatar = u?.avatar || null;
     next();
   } catch {
     next(new Error('Geçersiz token'));
@@ -141,95 +220,90 @@ io.on('connection', (socket) => {
   const { id: userId, username } = socket.user;
   console.log(`[+] ${username} bağlandı (${socket.id})`);
 
-  // Bağlanınca mevcut sesli oda durumunu gönder
   socket.on('get-voice-state', () => {
     const state = {};
     Object.entries(voiceRooms).forEach(([channelId, users]) => {
-      state[channelId] = Object.values(users).map(u => u.username);
+      state[channelId] = Object.entries(users).map(([sid, u]) => ({
+        socketId: sid, username: u.username, avatar: u.avatar
+      }));
     });
     socket.emit('voice-state', state);
   });
 
-  // Metin kanalı
   socket.on('join-channel', (channelId) => {
     if (socket.textChannel) socket.leave(`text:${socket.textChannel}`);
     socket.textChannel = channelId;
     socket.join(`text:${channelId}`);
   });
 
-  socket.on('send-message', ({ channelId, content }) => {
+  socket.on('send-message', ({ channelId, content, replyToId }) => {
     const trimmed = content?.trim();
     if (!trimmed || trimmed.length > 2000) return;
 
     const result = db.prepare(
-      'INSERT INTO messages (channel_id, user_id, content) VALUES (?, ?, ?)'
-    ).run(channelId, userId, trimmed);
+      'INSERT INTO messages (channel_id, user_id, content, reply_to_id) VALUES (?, ?, ?, ?)'
+    ).run(channelId, userId, trimmed, replyToId || null);
 
-    const msg = db.prepare(`
-      SELECT m.id, m.content, m.created_at, u.username, u.id as user_id
-      FROM messages m JOIN users u ON m.user_id = u.id
-      WHERE m.id = ?
-    `).get(result.lastInsertRowid);
-
+    const msg = db.prepare(`${MSG_SELECT} WHERE m.id = ?`).get(result.lastInsertRowid);
     io.to(`text:${channelId}`).emit('new-message', msg);
   });
 
-  // Sesli kanal
   socket.on('join-voice', (channelId) => {
+    if (socket.voiceChannel && socket.voiceChannel !== channelId) handleLeaveVoice(socket);
     if (!voiceRooms[channelId]) voiceRooms[channelId] = {};
 
     const existing = Object.entries(voiceRooms[channelId])
       .filter(([sid]) => sid !== socket.id)
-      .map(([sid, data]) => ({ socketId: sid, username: data.username }));
+      .map(([sid, data]) => ({ socketId: sid, username: data.username, avatar: data.avatar }));
 
-    voiceRooms[channelId][socket.id] = { username, userId };
+    voiceRooms[channelId][socket.id] = { username, userId, avatar: socket.user.avatar };
     socket.voiceChannel = channelId;
     socket.join(`voice:${channelId}`);
 
-    // Mevcut katılımcıları yeni kullanıcıya bildir (o teklif yapacak)
     socket.emit('voice-participants', { channelId, participants: existing });
-
-    // Diğerlerine yeni katılımcıyı bildir
     socket.to(`voice:${channelId}`).emit('user-joined-voice', {
-      channelId, socketId: socket.id, username
+      channelId, socketId: socket.id, username, avatar: socket.user.avatar
     });
-
     broadcastVoiceUpdate(channelId);
   });
 
   socket.on('leave-voice', () => handleLeaveVoice(socket));
 
-  // WebRTC sinyalleşme - sunucu sadece iletim yapar
+  socket.on('admin-kick-voice', ({ targetSocketId }) => {
+    const adminUser = db.prepare('SELECT is_admin FROM users WHERE id=?').get(socket.user.id);
+    if (!adminUser?.is_admin) return;
+    const targetSocket = io.sockets.sockets.get(targetSocketId);
+    if (!targetSocket) return;
+    handleLeaveVoice(targetSocket);
+    targetSocket.emit('force-leave-voice');
+  });
+
+  socket.on('admin-move-voice', ({ targetSocketId, channelId }) => {
+    const adminUser = db.prepare('SELECT is_admin FROM users WHERE id=?').get(socket.user.id);
+    if (!adminUser?.is_admin) return;
+    const targetSocket = io.sockets.sockets.get(targetSocketId);
+    if (!targetSocket) return;
+    handleLeaveVoice(targetSocket);
+    targetSocket.emit('force-join-voice', { channelId });
+  });
+
   socket.on('webrtc-offer', ({ to, offer, channelId }) => {
     io.to(to).emit('webrtc-offer', { from: socket.id, fromUsername: username, offer, channelId });
   });
-
   socket.on('webrtc-answer', ({ to, answer }) => {
     io.to(to).emit('webrtc-answer', { from: socket.id, answer });
   });
-
   socket.on('webrtc-ice', ({ to, candidate }) => {
     io.to(to).emit('webrtc-ice', { from: socket.id, candidate });
   });
-
-  // Ekran paylaşımı bildirimleri
   socket.on('screen-share-started', ({ channelId }) => {
-    socket.to(`voice:${channelId}`).emit('screen-share-update', {
-      socketId: socket.id, username, sharing: true
-    });
+    socket.to(`voice:${channelId}`).emit('screen-share-update', { socketId: socket.id, username, sharing: true });
   });
-
   socket.on('screen-share-stopped', ({ channelId }) => {
-    socket.to(`voice:${channelId}`).emit('screen-share-update', {
-      socketId: socket.id, username, sharing: false
-    });
+    socket.to(`voice:${channelId}`).emit('screen-share-update', { socketId: socket.id, username, sharing: false });
   });
-
-  // Mikrofon durumu
   socket.on('mute-status', ({ channelId, muted }) => {
-    socket.to(`voice:${channelId}`).emit('user-mute-update', {
-      socketId: socket.id, username, muted
-    });
+    socket.to(`voice:${channelId}`).emit('user-mute-update', { socketId: socket.id, username, muted });
   });
 
   socket.on('disconnect', () => {
@@ -241,20 +315,17 @@ io.on('connection', (socket) => {
 function handleLeaveVoice(socket) {
   const channelId = socket.voiceChannel;
   if (!channelId || !voiceRooms[channelId]) return;
-
   delete voiceRooms[channelId][socket.id];
   socket.leave(`voice:${channelId}`);
   socket.voiceChannel = null;
-
-  io.to(`voice:${channelId}`).emit('user-left-voice', {
-    channelId, socketId: socket.id
-  });
-
+  io.to(`voice:${channelId}`).emit('user-left-voice', { channelId, socketId: socket.id });
   broadcastVoiceUpdate(channelId);
 }
 
 function broadcastVoiceUpdate(channelId) {
-  const participants = Object.values(voiceRooms[channelId] || {}).map(u => u.username);
+  const participants = Object.entries(voiceRooms[channelId] || {}).map(([sid, u]) => ({
+    socketId: sid, username: u.username, avatar: u.avatar
+  }));
   io.emit('voice-room-update', { channelId, participants });
 }
 

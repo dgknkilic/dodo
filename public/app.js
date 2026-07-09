@@ -1,22 +1,27 @@
 'use strict';
 
-// ============ STATE ============
 let token = localStorage.getItem('token');
 let username = localStorage.getItem('username');
+let isAdmin = false;
+let myAvatar = null;
 let socket = null;
 let webrtc = null;
 let channels = [];
 let currentChannel = null;
-let voiceChannelId = null;      // aktif sesli kanal ID
+let voiceChannelId = null;
 let voiceChannelName = null;
-let voiceParticipants = {};     // socketId -> username
-let voiceStates = {};           // channelId -> [usernames]
-let mutedUsers = {};            // socketId -> boolean
-let sharingUsers = {};          // socketId -> boolean
+let voiceParticipants = {};     // socketId -> {username, avatar}
+let voiceStates = {};           // channelId -> [{socketId, username, avatar}]
+let mutedUsers = {};
+let sharingUsers = {};
 let currentTab = 'login';
 let lastMessageDate = null;
-
-// ============ INIT ============
+let replyToId = null;
+let replyToPreview = null;
+let pendingMoveSocketId = null;
+let pendingAvatarDataUrl = undefined;
+let searchActive = false;
+let allMessages = [];           // for search
 
 if (token && username) {
   showApp();
@@ -31,8 +36,7 @@ document.querySelectorAll('.auth-tab').forEach(tab => {
     currentTab = tab.dataset.tab;
     document.querySelectorAll('.auth-tab').forEach(t => t.classList.remove('active'));
     tab.classList.add('active');
-    document.getElementById('auth-submit').textContent =
-      currentTab === 'login' ? 'Giriş Yap' : 'Kayıt Ol';
+    document.getElementById('auth-submit').textContent = currentTab === 'login' ? 'Giriş Yap' : 'Kayıt Ol';
     document.getElementById('auth-error').textContent = '';
   });
 });
@@ -43,11 +47,9 @@ document.getElementById('auth-form').addEventListener('submit', async (e) => {
   const passwordVal = document.getElementById('auth-password').value;
   const errorEl = document.getElementById('auth-error');
   const submitBtn = document.getElementById('auth-submit');
-
   errorEl.textContent = '';
   submitBtn.disabled = true;
   submitBtn.textContent = '...';
-
   try {
     const res = await fetch(`/api/${currentTab}`, {
       method: 'POST',
@@ -55,12 +57,7 @@ document.getElementById('auth-form').addEventListener('submit', async (e) => {
       body: JSON.stringify({ username: usernameVal, password: passwordVal })
     });
     const data = await res.json();
-
-    if (!res.ok) {
-      errorEl.textContent = data.error || 'Hata oluştu';
-      return;
-    }
-
+    if (!res.ok) { errorEl.textContent = data.error || 'Hata oluştu'; return; }
     token = data.token;
     username = data.username;
     localStorage.setItem('token', token);
@@ -74,19 +71,17 @@ document.getElementById('auth-form').addEventListener('submit', async (e) => {
   }
 });
 
-document.getElementById('logout-btn').addEventListener('click', logout);
+document.getElementById('logout-btn').addEventListener('click', (e) => { e.stopPropagation(); logout(); });
 
 function logout() {
   if (webrtc) webrtc.leaveVoice();
   if (socket) socket.disconnect();
   localStorage.removeItem('token');
   localStorage.removeItem('username');
-  token = null;
-  username = null;
   location.reload();
 }
 
-// ============ VIEW HELPERS ============
+// ============ VIEW ============
 
 function showLoginView() {
   document.getElementById('login-view').classList.remove('hidden');
@@ -96,13 +91,6 @@ function showLoginView() {
 function showApp() {
   document.getElementById('login-view').classList.add('hidden');
   document.getElementById('app-view').classList.remove('hidden');
-
-  const userNameEl = document.getElementById('user-name');
-  const userAvatarEl = document.getElementById('user-avatar');
-  userNameEl.textContent = username;
-  userAvatarEl.textContent = username[0].toUpperCase();
-  userAvatarEl.className = `user-avatar avatar-color-${avatarColor(username)}`;
-
   initApp();
 }
 
@@ -111,26 +99,19 @@ function showView(viewId) {
   document.getElementById(viewId).classList.remove('hidden');
 }
 
-// ============ APP INIT ============
+// ============ INIT ============
 
 async function initApp() {
-  // Socket.io bağlantısı
+  await loadMe();
+
   socket = io({ auth: { token } });
 
-  socket.on('connect', () => {
-    socket.emit('get-voice-state');
-  });
+  socket.on('connect', () => socket.emit('get-voice-state'));
+  socket.on('connect_error', (err) => { if (err.message.includes('token') || err.message.includes('kimlik')) logout(); });
 
-  socket.on('connect_error', (err) => {
-    if (err.message.includes('token') || err.message.includes('kimlik')) {
-      logout();
-    }
-  });
-
-  // WebRTC yöneticisi
   webrtc = new WebRTCManager(socket);
-  webrtc.onParticipantJoined = (socketId, uname) => {
-    voiceParticipants[socketId] = uname;
+  webrtc.onParticipantJoined = (socketId, uname, avatar) => {
+    voiceParticipants[socketId] = { username: uname, avatar: avatar || null };
     renderVoiceParticipants();
   };
   webrtc.onParticipantLeft = (socketId) => {
@@ -140,55 +121,81 @@ async function initApp() {
     renderVoiceParticipants();
   };
   webrtc.onScreenShareStart = (socketId, stream, uname) => {
-    showScreenShare(socketId, stream, uname || voiceParticipants[socketId]);
+    const uData = voiceParticipants[socketId];
+    showScreenShare(socketId, stream, uname || uData?.username);
   };
-  webrtc.onScreenShareStop = (socketId) => {
-    hideScreenShare(socketId);
-  };
+  webrtc.onScreenShareStop = (socketId) => hideScreenShare(socketId);
 
-  // Socket olayları
-  socket.on('voice-state', (state) => {
-    voiceStates = state;
-    renderChannels();
-  });
-
+  socket.on('voice-state', (state) => { voiceStates = state; renderChannels(); });
   socket.on('voice-room-update', ({ channelId, participants }) => {
     voiceStates[channelId] = participants;
     renderChannels();
-    if (currentChannel?.id == channelId && currentChannel?.type === 'voice') {
-      // Eğer bu kanaldaysak ve katılmadıysak, sadece katılımcı listesini güncelle
-      if (!voiceChannelId) renderVoiceParticipantsFromState(channelId);
+    if (currentChannel?.id == channelId && currentChannel?.type === 'voice' && !voiceChannelId) {
+      renderVoiceParticipantsFromState(channelId);
     }
   });
-
-  socket.on('new-message', (msg) => {
-    if (currentChannel?.id == msg.channel_id || currentChannel?.id === msg.channel_id) {
-      appendMessage(msg);
-    }
+  socket.on('new-message', (msg) => { if (currentChannel?.id == msg.channel_id) appendMessage(msg); });
+  socket.on('message-deleted', ({ messageId }) => removeMessageEl(messageId));
+  socket.on('channel-cleared', () => {
+    document.getElementById('messages').innerHTML = '';
+    allMessages = [];
+    lastMessageDate = null;
+  });
+  socket.on('user-mute-update', ({ socketId, muted }) => { mutedUsers[socketId] = muted; renderVoiceParticipants(); });
+  socket.on('force-leave-voice', () => { leaveVoice(); showToast('Ses kanalından çıkarıldınız.'); });
+  socket.on('force-join-voice', async ({ channelId }) => {
+    const ch = channels.find(c => c.id == channelId);
+    if (!ch) return;
+    showToast(`"${ch.name}" kanalına taşındınız.`);
+    await selectChannel(ch);
   });
 
-  socket.on('user-mute-update', ({ socketId, muted }) => {
-    mutedUsers[socketId] = muted;
-    renderVoiceParticipants();
-  });
-
-  // Kanalları yükle
   await loadChannels();
+}
+
+async function loadMe() {
+  try {
+    const res = await fetch('/api/me', { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) return;
+    const user = await res.json();
+    isAdmin = !!user.is_admin;
+    myAvatar = user.avatar || null;
+    username = user.username;
+    localStorage.setItem('username', username);
+    renderUserBar();
+    // Admin menü öğelerini göster
+    document.querySelectorAll('.admin-only').forEach(el => {
+      if (isAdmin) el.classList.remove('hidden');
+    });
+  } catch {}
+}
+
+function renderUserBar() {
+  const nameEl = document.getElementById('user-name');
+  const avatarEl = document.getElementById('user-avatar');
+  nameEl.textContent = username + (isAdmin ? ' 👑' : '');
+  setAvatarEl(avatarEl, username, myAvatar, 'user-avatar');
+}
+
+function setAvatarEl(el, uname, avatar, baseClass) {
+  if (avatar) {
+    el.innerHTML = `<img src="${avatar}" alt="${uname}" />`;
+    el.className = baseClass + ' has-img';
+  } else {
+    el.textContent = uname[0].toUpperCase();
+    el.className = `${baseClass} avatar-color-${avatarColor(uname)}`;
+  }
 }
 
 // ============ CHANNELS ============
 
 async function loadChannels() {
   try {
-    const res = await fetch('/api/channels', {
-      headers: { Authorization: `Bearer ${token}` }
-    });
+    const res = await fetch('/api/channels', { headers: { Authorization: `Bearer ${token}` } });
     if (!res.ok) { logout(); return; }
     channels = await res.json();
     renderChannels();
-  } catch {
-    console.error('Kanallar yüklenemedi');
-  }
+  } catch {}
 }
 
 function renderChannels() {
@@ -196,7 +203,6 @@ function renderChannels() {
   const voiceContainer = document.getElementById('voice-channels');
   textContainer.innerHTML = '';
   voiceContainer.innerHTML = '';
-
   channels.forEach(ch => {
     const el = createChannelElement(ch);
     if (ch.type === 'text') textContainer.appendChild(el);
@@ -206,37 +212,39 @@ function renderChannels() {
 
 function createChannelElement(ch) {
   const item = document.createElement('div');
-  item.className = 'channel-item';
+  item.className = 'channel-item' + (currentChannel?.id === ch.id ? ' active' : '');
   item.dataset.channelId = ch.id;
-  if (currentChannel?.id === ch.id) item.classList.add('active');
 
   const row = document.createElement('div');
   row.className = 'channel-item-row';
-
   const prefix = document.createElement('span');
   prefix.className = 'channel-prefix';
   prefix.textContent = ch.type === 'text' ? '#' : '🔊';
-
   const name = document.createElement('span');
   name.className = 'channel-name';
   name.textContent = ch.name;
-
   row.appendChild(prefix);
   row.appendChild(name);
   item.appendChild(row);
 
-  // Sesli kanal için katılımcı listesi
   if (ch.type === 'voice') {
     const members = voiceStates[ch.id] || [];
     if (members.length > 0) {
       const memberList = document.createElement('div');
       memberList.className = 'voice-member-list';
-      members.forEach(uname => {
+      members.forEach(m => {
+        const uname = typeof m === 'string' ? m : m.username;
+        const avatar = typeof m === 'object' ? m.avatar : null;
         const mi = document.createElement('div');
         mi.className = 'voice-member-item';
         const av = document.createElement('div');
-        av.className = `voice-member-avatar avatar-color-${avatarColor(uname)}`;
-        av.textContent = uname[0].toUpperCase();
+        if (avatar) {
+          av.innerHTML = `<img src="${avatar}" alt="${uname}" />`;
+          av.className = 'voice-member-avatar has-img';
+        } else {
+          av.className = `voice-member-avatar avatar-color-${avatarColor(uname)}`;
+          av.textContent = uname[0].toUpperCase();
+        }
         const mn = document.createElement('span');
         mn.className = 'voice-member-name';
         mn.textContent = uname;
@@ -259,13 +267,31 @@ async function selectChannel(ch) {
   if (ch.type === 'text') {
     showView('text-view');
     document.getElementById('text-channel-name').textContent = ch.name;
+    closeSearch();
+    clearReply();
     socket.emit('join-channel', ch.id);
     await loadMessages(ch.id);
   } else {
     showView('voice-view');
     document.getElementById('voice-channel-name').textContent = ch.name;
-    renderVoiceParticipantsFromState(ch.id);
-    updateVoiceUI();
+
+    if (voiceChannelId == ch.id) { updateVoiceUI(); return; }
+    if (voiceChannelId) leaveVoice();
+
+    try {
+      await webrtc.joinVoice(ch.id);
+      voiceChannelId = ch.id;
+      voiceChannelName = ch.name;
+      voiceParticipants = {};
+      mutedUsers = {};
+      sharingUsers = {};
+      updateVoiceUI();
+      showVoiceBar(ch.name);
+    } catch {
+      renderVoiceParticipantsFromState(ch.id);
+      document.getElementById('join-voice-area').classList.remove('hidden');
+      document.getElementById('voice-controls').classList.add('hidden');
+    }
   }
 }
 
@@ -274,27 +300,25 @@ async function selectChannel(ch) {
 async function loadMessages(channelId) {
   const messagesEl = document.getElementById('messages');
   messagesEl.innerHTML = '';
+  allMessages = [];
   lastMessageDate = null;
-
   try {
-    const res = await fetch(`/api/messages/${channelId}`, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
+    const res = await fetch(`/api/messages/${channelId}`, { headers: { Authorization: `Bearer ${token}` } });
     const msgs = await res.json();
     msgs.forEach(msg => appendMessage(msg, false));
     scrollMessages();
-  } catch {
-    console.error('Mesajlar yüklenemedi');
-  }
+  } catch {}
 }
 
 function appendMessage(msg, scroll = true) {
   if (currentChannel?.type !== 'text') return;
+  if (searchActive) return;
+
+  allMessages.push(msg);
 
   const messagesEl = document.getElementById('messages');
   const msgDate = new Date(msg.created_at).toLocaleDateString('tr-TR');
 
-  // Tarih ayracı
   if (msgDate !== lastMessageDate) {
     const divider = document.createElement('div');
     divider.className = 'msg-date-divider';
@@ -303,27 +327,43 @@ function appendMessage(msg, scroll = true) {
     lastMessageDate = msgDate;
   }
 
+  const group = createMessageEl(msg);
+  messagesEl.appendChild(group);
+  if (scroll) scrollMessages();
+}
+
+function createMessageEl(msg) {
+  const canDelete = isAdmin || msg.user_id === getCurrentUserId();
+
   const group = document.createElement('div');
   group.className = 'msg-group';
+  group.dataset.msgId = msg.id;
+
+  // Yanıt önizleme
+  if (msg.reply_to_id && msg.reply_username) {
+    const replyPreview = document.createElement('div');
+    replyPreview.className = 'msg-reply-preview';
+    replyPreview.innerHTML = `<span class="reply-user">↩ ${msg.reply_username}</span><span class="reply-text">${escapeHtml(msg.reply_content || '')}</span>`;
+    group.appendChild(replyPreview);
+  }
+
+  const inner = document.createElement('div');
+  inner.className = 'msg-inner';
 
   const avatar = document.createElement('div');
-  avatar.className = `msg-avatar avatar-color-${avatarColor(msg.username)}`;
-  avatar.textContent = msg.username[0].toUpperCase();
+  setAvatarEl(avatar, msg.username, msg.avatar || null, 'msg-avatar');
 
   const body = document.createElement('div');
   body.className = 'msg-body';
 
   const meta = document.createElement('div');
   meta.className = 'msg-meta';
-
   const uname = document.createElement('span');
   uname.className = 'msg-username';
   uname.textContent = msg.username;
-
   const time = document.createElement('span');
   time.className = 'msg-time';
   time.textContent = formatTime(msg.created_at);
-
   meta.appendChild(uname);
   meta.appendChild(time);
 
@@ -333,11 +373,42 @@ function appendMessage(msg, scroll = true) {
 
   body.appendChild(meta);
   body.appendChild(content);
-  group.appendChild(avatar);
-  group.appendChild(body);
-  messagesEl.appendChild(group);
+  inner.appendChild(avatar);
+  inner.appendChild(body);
 
-  if (scroll) scrollMessages();
+  // Aksiyon butonları (hover'da görünür)
+  const actions = document.createElement('div');
+  actions.className = 'msg-actions';
+
+  const replyBtn = document.createElement('button');
+  replyBtn.className = 'msg-action-btn';
+  replyBtn.title = 'Yanıtla';
+  replyBtn.textContent = '↩';
+  replyBtn.addEventListener('click', () => setReply(msg));
+  actions.appendChild(replyBtn);
+
+  if (canDelete) {
+    const delBtn = document.createElement('button');
+    delBtn.className = 'msg-action-btn danger';
+    delBtn.title = 'Sil';
+    delBtn.textContent = '🗑';
+    delBtn.addEventListener('click', () => confirmDeleteMessage(msg.id));
+    actions.appendChild(delBtn);
+  }
+
+  inner.appendChild(actions);
+  group.appendChild(inner);
+  return group;
+}
+
+function removeMessageEl(messageId) {
+  const el = document.querySelector(`[data-msg-id="${messageId}"]`);
+  if (el) el.remove();
+  allMessages = allMessages.filter(m => m.id !== messageId);
+}
+
+function getCurrentUserId() {
+  try { return JSON.parse(atob(token.split('.')[1])).id; } catch { return null; }
 }
 
 function scrollMessages() {
@@ -345,161 +416,296 @@ function scrollMessages() {
   el.scrollTop = el.scrollHeight;
 }
 
-// Mesaj gönder
 document.getElementById('message-input').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault();
-    sendMessage();
-  }
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 });
-
 document.getElementById('send-btn').addEventListener('click', sendMessage);
 
 function sendMessage() {
   const input = document.getElementById('message-input');
   const content = input.value.trim();
   if (!content || !currentChannel) return;
-  socket.emit('send-message', { channelId: currentChannel.id, content });
+  socket.emit('send-message', { channelId: currentChannel.id, content, replyToId });
   input.value = '';
+  clearReply();
 }
 
-// ============ VOICE CHANNEL ============
+// ============ REPLY ============
+
+function setReply(msg) {
+  replyToId = msg.id;
+  replyToPreview = msg;
+  const bar = document.getElementById('reply-bar');
+  const preview = document.getElementById('reply-bar-preview');
+  preview.textContent = `@${msg.username}: ${msg.content.slice(0, 60)}${msg.content.length > 60 ? '…' : ''}`;
+  bar.classList.remove('hidden');
+  document.getElementById('message-input').focus();
+}
+
+function clearReply() {
+  replyToId = null;
+  replyToPreview = null;
+  document.getElementById('reply-bar').classList.add('hidden');
+  document.getElementById('reply-bar-preview').textContent = '';
+}
+
+document.getElementById('reply-bar-close').addEventListener('click', clearReply);
+
+// ============ DELETE MESSAGE ============
+
+function confirmDeleteMessage(msgId) {
+  showConfirm('Mesajı Sil', 'Bu mesaj kalıcı olarak silinecek.', async () => {
+    try {
+      await fetch(`/api/messages/${msgId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+    } catch {}
+  });
+}
+
+// ============ SEARCH ============
+
+document.getElementById('search-toggle-btn').addEventListener('click', () => {
+  searchActive = !searchActive;
+  document.getElementById('search-bar').classList.toggle('hidden', !searchActive);
+  if (searchActive) {
+    document.getElementById('search-input').focus();
+  } else {
+    closeSearch();
+    reloadCurrentMessages();
+  }
+});
+
+document.getElementById('search-close-btn').addEventListener('click', () => {
+  closeSearch();
+  reloadCurrentMessages();
+});
+
+document.getElementById('search-input').addEventListener('input', (e) => {
+  const q = e.target.value.trim().toLowerCase();
+  renderSearchResults(q);
+});
+
+function closeSearch() {
+  searchActive = false;
+  document.getElementById('search-bar').classList.add('hidden');
+  document.getElementById('search-input').value = '';
+}
+
+function renderSearchResults(q) {
+  const messagesEl = document.getElementById('messages');
+  messagesEl.innerHTML = '';
+  if (!q) { reloadCurrentMessages(); return; }
+  const filtered = allMessages.filter(m =>
+    m.content.toLowerCase().includes(q) || m.username.toLowerCase().includes(q)
+  );
+  if (!filtered.length) {
+    messagesEl.innerHTML = '<div class="search-empty">Sonuç bulunamadı</div>';
+    return;
+  }
+  const prevSearchActive = searchActive;
+  searchActive = false;
+  lastMessageDate = null;
+  filtered.forEach(msg => appendMessage(msg, false));
+  searchActive = prevSearchActive;
+}
+
+async function reloadCurrentMessages() {
+  if (currentChannel?.type === 'text') await loadMessages(currentChannel.id);
+}
+
+// ============ CHANNEL MENU (3 NOKTA) ============
+
+document.getElementById('channel-menu-btn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  const dd = document.getElementById('channel-dropdown');
+  dd.classList.toggle('hidden');
+});
+
+document.addEventListener('click', () => {
+  document.getElementById('channel-dropdown')?.classList.add('hidden');
+});
+
+document.getElementById('menu-info').addEventListener('click', async () => {
+  if (!currentChannel) return;
+  try {
+    const res = await fetch(`/api/channels/${currentChannel.id}/info`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const data = await res.json();
+    const body = document.getElementById('info-modal-body');
+    document.getElementById('info-modal-title').textContent = `# ${currentChannel.name}`;
+    body.innerHTML = `
+      <div class="info-row"><span>📝 Toplam Mesaj</span><strong>${data.message_count}</strong></div>
+      <div class="info-row"><span>👥 Farklı Kullanıcı</span><strong>${data.user_count}</strong></div>
+    `;
+    document.getElementById('info-modal-overlay').classList.remove('hidden');
+  } catch {}
+});
+
+document.getElementById('menu-clear').addEventListener('click', () => {
+  if (!currentChannel || !isAdmin) return;
+  showConfirm('Sohbeti Temizle', `"${currentChannel.name}" kanalındaki tüm mesajlar silinecek. Bu işlem geri alınamaz.`, async () => {
+    try {
+      await fetch(`/api/channels/${currentChannel.id}/messages`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+    } catch {}
+  });
+});
+
+document.getElementById('info-modal-close').addEventListener('click', () => document.getElementById('info-modal-overlay').classList.add('hidden'));
+document.getElementById('info-modal-ok').addEventListener('click', () => document.getElementById('info-modal-overlay').classList.add('hidden'));
+
+// ============ CONFIRM MODAL ============
+
+let confirmCallback = null;
+
+function showConfirm(title, text, onConfirm) {
+  document.getElementById('confirm-modal-title').textContent = title;
+  document.getElementById('confirm-modal-text').textContent = text;
+  confirmCallback = onConfirm;
+  document.getElementById('confirm-modal-overlay').classList.remove('hidden');
+}
+
+document.getElementById('confirm-cancel-btn').addEventListener('click', () => {
+  document.getElementById('confirm-modal-overlay').classList.add('hidden');
+  confirmCallback = null;
+});
+
+document.getElementById('confirm-ok-btn').addEventListener('click', async () => {
+  document.getElementById('confirm-modal-overlay').classList.add('hidden');
+  if (confirmCallback) { await confirmCallback(); confirmCallback = null; }
+});
+
+// ============ VOICE ============
 
 function renderVoiceParticipantsFromState(channelId) {
-  // Sesli odayı göster ama katılımcıları state'ten al (socket bilmediğimiz ID'ler)
   const container = document.getElementById('voice-participants');
   container.innerHTML = '';
   const members = voiceStates[channelId] || [];
-  members.forEach(uname => {
-    const el = createParticipantEl(`state-${uname}`, uname, false, false);
-    container.appendChild(el);
+  members.forEach(m => {
+    const sid = typeof m === 'string' ? `state-${m}` : m.socketId;
+    const uname = typeof m === 'string' ? m : m.username;
+    const avatar = typeof m === 'object' ? m.avatar : null;
+    container.appendChild(createParticipantEl(sid, uname, avatar, false, false));
   });
 }
 
 function renderVoiceParticipants() {
   const container = document.getElementById('voice-participants');
   container.innerHTML = '';
-
-  // Kendimizi ekle
-  const myEl = createParticipantEl('me', username, webrtc?.isMuted, webrtc?.isSharing);
-  container.appendChild(myEl);
-
-  // Diğerlerini ekle
-  Object.entries(voiceParticipants).forEach(([socketId, uname]) => {
-    const el = createParticipantEl(socketId, uname, mutedUsers[socketId], sharingUsers[socketId]);
-    container.appendChild(el);
+  container.appendChild(createParticipantEl('me', username, myAvatar, webrtc?.isMuted, webrtc?.isSharing));
+  Object.entries(voiceParticipants).forEach(([socketId, data]) => {
+    const uname = typeof data === 'string' ? data : data.username;
+    const avatar = typeof data === 'object' ? data.avatar : null;
+    container.appendChild(createParticipantEl(socketId, uname, avatar, mutedUsers[socketId], sharingUsers[socketId]));
   });
 }
 
-function createParticipantEl(socketId, uname, muted, sharing) {
+function createParticipantEl(socketId, uname, avatar, muted, sharing) {
   const el = document.createElement('div');
   el.className = 'voice-participant';
   el.id = `vp-${socketId}`;
 
-  const avatar = document.createElement('div');
-  avatar.className = `vp-avatar avatar-color-${avatarColor(uname)}`;
-  if (muted) avatar.classList.add('muted');
-  if (sharing) avatar.classList.add('vp-sharing');
-  avatar.textContent = uname[0].toUpperCase();
+  const av = document.createElement('div');
+  av.className = `vp-avatar${muted ? ' muted' : ''}${sharing ? ' vp-sharing' : ''}`;
+  if (avatar) {
+    av.innerHTML = `<img src="${avatar}" alt="${uname}" />`;
+    av.classList.add('has-img');
+  } else {
+    av.classList.add(`avatar-color-${avatarColor(uname)}`);
+    av.textContent = uname[0].toUpperCase();
+  }
 
   const name = document.createElement('div');
   name.className = 'vp-name';
   name.textContent = uname === username ? `${uname} (sen)` : uname;
 
-  el.appendChild(avatar);
+  el.appendChild(av);
   el.appendChild(name);
+
+  if (isAdmin && socketId !== 'me' && !socketId.startsWith('state-') && uname !== username) {
+    const adminBtns = document.createElement('div');
+    adminBtns.className = 'vp-admin-btns';
+
+    const kickBtn = document.createElement('button');
+    kickBtn.className = 'vp-admin-btn kick';
+    kickBtn.title = 'Kanaldan at';
+    kickBtn.textContent = '✕';
+    kickBtn.addEventListener('click', (e) => { e.stopPropagation(); socket.emit('admin-kick-voice', { targetSocketId: socketId }); });
+
+    const moveBtn = document.createElement('button');
+    moveBtn.className = 'vp-admin-btn move';
+    moveBtn.title = 'Başka kanala taşı';
+    moveBtn.textContent = '↗';
+    moveBtn.addEventListener('click', (e) => { e.stopPropagation(); showMoveModal(socketId, uname); });
+
+    adminBtns.appendChild(kickBtn);
+    adminBtns.appendChild(moveBtn);
+    el.appendChild(adminBtns);
+  }
+
   return el;
 }
 
 function updateVoiceUI() {
-  const isInThisVoice = voiceChannelId && voiceChannelId == currentChannel?.id;
-  document.getElementById('join-voice-area').classList.toggle('hidden', isInThisVoice);
-  document.getElementById('voice-controls').classList.toggle('hidden', !isInThisVoice);
-
-  if (isInThisVoice) renderVoiceParticipants();
+  const isIn = voiceChannelId && voiceChannelId == currentChannel?.id;
+  document.getElementById('join-voice-area').classList.add('hidden');
+  document.getElementById('voice-controls').classList.toggle('hidden', !isIn);
+  if (isIn) renderVoiceParticipants();
 }
 
-// Sesli kanala katıl butonu
 document.getElementById('join-voice-btn').addEventListener('click', async () => {
   if (!currentChannel || currentChannel.type !== 'voice') return;
   const btn = document.getElementById('join-voice-btn');
   btn.disabled = true;
   btn.textContent = 'Bağlanıyor...';
-
   try {
+    if (voiceChannelId && voiceChannelId !== currentChannel.id) leaveVoice();
     await webrtc.joinVoice(currentChannel.id);
     voiceChannelId = currentChannel.id;
     voiceChannelName = currentChannel.name;
     voiceParticipants = {};
     mutedUsers = {};
     sharingUsers = {};
-
     updateVoiceUI();
     showVoiceBar(currentChannel.name);
-  } catch (err) {
-    alert(err.message);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '🎤 Sese Katıl';
-  }
+  } catch (err) { alert(err.message); }
+  finally { btn.disabled = false; btn.textContent = '🎤 Sese Katıl'; }
 });
 
-// Sessize al
 document.getElementById('mute-btn').addEventListener('click', toggleMute);
 document.getElementById('vbar-mute').addEventListener('click', toggleMute);
 
 function toggleMute() {
   if (!webrtc) return;
   const isMuted = webrtc.toggleMute();
-  const muteBtn = document.getElementById('mute-btn');
-  const vbarMute = document.getElementById('vbar-mute');
-
-  if (isMuted) {
-    muteBtn.classList.add('muted');
-    muteBtn.querySelector('.btn-label').textContent = 'Sesi Aç';
-    vbarMute.classList.add('muted');
-    vbarMute.textContent = '🔇';
-  } else {
-    muteBtn.classList.remove('muted');
-    muteBtn.querySelector('.btn-label').textContent = 'Sessize Al';
-    vbarMute.classList.remove('muted');
-    vbarMute.textContent = '🎤';
-  }
+  document.getElementById('mute-btn').classList.toggle('muted', isMuted);
+  document.getElementById('mute-btn').querySelector('.btn-label').textContent = isMuted ? 'Sesi Aç' : 'Sessize Al';
+  document.getElementById('vbar-mute').classList.toggle('muted', isMuted);
+  document.getElementById('vbar-mute').textContent = isMuted ? '🔇' : '🎤';
   renderVoiceParticipants();
 }
 
-// Ekran paylaş
 document.getElementById('screen-btn').addEventListener('click', toggleScreenShare);
 document.getElementById('vbar-screen').addEventListener('click', toggleScreenShare);
 
 async function toggleScreenShare() {
   if (!webrtc) return;
   try {
-    if (webrtc.isSharing) {
-      webrtc.stopScreenShare();
-      updateScreenBtn(false);
-    } else {
-      await webrtc.startScreenShare();
-      updateScreenBtn(true);
-    }
-  } catch (err) {
-    if (!err.message.includes('iptal')) alert(err.message);
-    updateScreenBtn(false);
-  }
+    if (webrtc.isSharing) { webrtc.stopScreenShare(); updateScreenBtn(false); }
+    else { await webrtc.startScreenShare(); updateScreenBtn(true); }
+  } catch (err) { if (!err.message.includes('iptal')) alert(err.message); updateScreenBtn(false); }
 }
 
 function updateScreenBtn(sharing) {
-  const btn = document.getElementById('screen-btn');
-  if (sharing) {
-    btn.classList.add('sharing');
-    btn.querySelector('.btn-label').textContent = 'Paylaşımı Durdur';
-  } else {
-    btn.classList.remove('sharing');
-    btn.querySelector('.btn-label').textContent = 'Ekran Paylaş';
-  }
+  document.getElementById('screen-btn').classList.toggle('sharing', sharing);
+  document.getElementById('screen-btn').querySelector('.btn-label').textContent = sharing ? 'Paylaşımı Durdur' : 'Ekran Paylaş';
 }
 
-// Kanaldan ayrıl
 document.getElementById('leave-btn').addEventListener('click', leaveVoice);
 document.getElementById('vbar-leave').addEventListener('click', leaveVoice);
 
@@ -511,65 +717,44 @@ function leaveVoice() {
   voiceParticipants = {};
   mutedUsers = {};
   sharingUsers = {};
-
-  // Ekran paylaşımlarını temizle
   document.getElementById('screen-shares').innerHTML = '';
   document.getElementById('screen-shares').classList.add('hidden');
-
-  // Butonları sıfırla
   updateScreenBtn(false);
   document.getElementById('mute-btn').classList.remove('muted');
   document.getElementById('mute-btn').querySelector('.btn-label').textContent = 'Sessize Al';
   document.getElementById('vbar-mute').classList.remove('muted');
   document.getElementById('vbar-mute').textContent = '🎤';
-
   hideVoiceBar();
   updateVoiceUI();
+  if (currentChannel?.type === 'voice') renderVoiceParticipantsFromState(currentChannel.id);
 }
 
-// ============ VOICE BAR ============
-
 function showVoiceBar(chName) {
-  const bar = document.getElementById('voice-bar');
   document.getElementById('voice-bar-channel').textContent = chName;
-  bar.classList.remove('hidden');
+  document.getElementById('voice-bar').classList.remove('hidden');
 }
 
 function hideVoiceBar() {
   document.getElementById('voice-bar').classList.add('hidden');
 }
 
-// ============ SCREEN SHARING ============
-
 function showScreenShare(socketId, stream, uname) {
   const container = document.getElementById('screen-shares');
   container.classList.remove('hidden');
-
   let item = document.getElementById(`ss-${socketId}`);
   if (!item) {
     item = document.createElement('div');
     item.className = 'screen-share-item';
     item.id = `ss-${socketId}`;
-
     const video = document.createElement('video');
-    video.autoplay = true;
-    video.playsInline = true;
-    video.muted = (socketId === 'me');
-
+    video.autoplay = true; video.playsInline = true; video.muted = (socketId === 'me');
     const label = document.createElement('div');
     label.className = 'screen-share-label';
     label.textContent = `🖥️ ${uname || username}`;
-
-    item.appendChild(video);
-    item.appendChild(label);
+    item.appendChild(video); item.appendChild(label);
     container.appendChild(item);
   }
-
-  if (stream) {
-    const video = item.querySelector('video');
-    video.srcObject = stream;
-  }
-
+  if (stream) item.querySelector('video').srcObject = stream;
   sharingUsers[socketId] = true;
   renderVoiceParticipants();
 }
@@ -577,13 +762,140 @@ function showScreenShare(socketId, stream, uname) {
 function hideScreenShare(socketId) {
   const item = document.getElementById(`ss-${socketId}`);
   if (item) item.remove();
-
   const container = document.getElementById('screen-shares');
   if (!container.children.length) container.classList.add('hidden');
-
   delete sharingUsers[socketId];
   renderVoiceParticipants();
   updateScreenBtn(false);
+}
+
+// ============ PROFİL MODALI ============
+
+document.getElementById('user-bar-btn').addEventListener('click', openProfileModal);
+
+function openProfileModal() {
+  pendingAvatarDataUrl = undefined;
+  document.getElementById('profile-username-input').value = username;
+  document.getElementById('profile-error').textContent = '';
+  document.getElementById('avatar-file-input').value = '';
+  updateProfileAvatarPreview(myAvatar);
+  document.getElementById('avatar-remove-btn').classList.toggle('hidden', !myAvatar);
+  document.getElementById('profile-modal-overlay').classList.remove('hidden');
+}
+
+function updateProfileAvatarPreview(src) {
+  const preview = document.getElementById('profile-avatar-preview');
+  if (src) {
+    preview.innerHTML = `<img src="${src}" alt="avatar" />`;
+    preview.className = 'profile-avatar-preview has-img';
+  } else {
+    preview.textContent = username[0].toUpperCase();
+    preview.className = `profile-avatar-preview avatar-color-${avatarColor(username)}`;
+  }
+}
+
+document.getElementById('avatar-file-input').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 128; canvas.height = 128;
+      const ctx = canvas.getContext('2d');
+      const size = Math.min(img.width, img.height);
+      const x = (img.width - size) / 2;
+      const y = (img.height - size) / 2;
+      ctx.drawImage(img, x, y, size, size, 0, 0, 128, 128);
+      pendingAvatarDataUrl = canvas.toDataURL('image/jpeg', 0.85);
+      updateProfileAvatarPreview(pendingAvatarDataUrl);
+      document.getElementById('avatar-remove-btn').classList.remove('hidden');
+    };
+    img.src = ev.target.result;
+  };
+  reader.readAsDataURL(file);
+});
+
+document.getElementById('avatar-remove-btn').addEventListener('click', () => {
+  pendingAvatarDataUrl = null;
+  updateProfileAvatarPreview(null);
+  document.getElementById('avatar-remove-btn').classList.add('hidden');
+  document.getElementById('avatar-file-input').value = '';
+});
+
+document.getElementById('profile-modal-close').addEventListener('click', () => document.getElementById('profile-modal-overlay').classList.add('hidden'));
+document.getElementById('profile-cancel-btn').addEventListener('click', () => document.getElementById('profile-modal-overlay').classList.add('hidden'));
+document.getElementById('profile-modal-overlay').addEventListener('click', (e) => {
+  if (e.target === document.getElementById('profile-modal-overlay')) document.getElementById('profile-modal-overlay').classList.add('hidden');
+});
+
+document.getElementById('profile-save-btn').addEventListener('click', async () => {
+  const newUsername = document.getElementById('profile-username-input').value.trim();
+  const errorEl = document.getElementById('profile-error');
+  const saveBtn = document.getElementById('profile-save-btn');
+  errorEl.textContent = '';
+  const body = {};
+  if (newUsername !== username) body.username = newUsername;
+  if (pendingAvatarDataUrl !== undefined) body.avatar = pendingAvatarDataUrl;
+  if (!Object.keys(body).length) { document.getElementById('profile-modal-overlay').classList.add('hidden'); return; }
+  saveBtn.disabled = true; saveBtn.textContent = 'Kaydediliyor...';
+  try {
+    const res = await fetch('/api/profile', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if (!res.ok) { errorEl.textContent = data.error || 'Hata oluştu'; return; }
+    token = data.token; username = data.username; myAvatar = data.avatar || null;
+    localStorage.setItem('token', token); localStorage.setItem('username', username);
+    renderUserBar();
+    document.getElementById('profile-modal-overlay').classList.add('hidden');
+  } catch { errorEl.textContent = 'Sunucuya bağlanılamadı'; }
+  finally { saveBtn.disabled = false; saveBtn.textContent = 'Kaydet'; }
+});
+
+// ============ TAŞI MODALI ============
+
+function showMoveModal(socketId, uname) {
+  pendingMoveSocketId = socketId;
+  document.getElementById('move-modal-title').textContent = `"${uname}" kanalına taşı`;
+  const select = document.getElementById('move-channel-select');
+  select.innerHTML = '';
+  channels.filter(c => c.type === 'voice').forEach(c => {
+    const opt = document.createElement('option');
+    opt.value = c.id; opt.textContent = c.name;
+    select.appendChild(opt);
+  });
+  document.getElementById('move-modal-overlay').classList.remove('hidden');
+}
+
+document.getElementById('move-modal-close').addEventListener('click', () => { document.getElementById('move-modal-overlay').classList.add('hidden'); pendingMoveSocketId = null; });
+document.getElementById('move-cancel-btn').addEventListener('click', () => { document.getElementById('move-modal-overlay').classList.add('hidden'); pendingMoveSocketId = null; });
+document.getElementById('move-modal-overlay').addEventListener('click', (e) => {
+  if (e.target === document.getElementById('move-modal-overlay')) { document.getElementById('move-modal-overlay').classList.add('hidden'); pendingMoveSocketId = null; }
+});
+document.getElementById('move-confirm-btn').addEventListener('click', () => {
+  if (!pendingMoveSocketId) return;
+  const channelId = parseInt(document.getElementById('move-channel-select').value);
+  socket.emit('admin-move-voice', { targetSocketId: pendingMoveSocketId, channelId });
+  document.getElementById('move-modal-overlay').classList.add('hidden');
+  pendingMoveSocketId = null;
+});
+
+// ============ TOAST ============
+
+function showToast(msg) {
+  const existing = document.getElementById('toast-msg');
+  if (existing) existing.remove();
+  const toast = document.createElement('div');
+  toast.id = 'toast-msg';
+  toast.className = 'toast';
+  toast.textContent = msg;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.classList.add('show'), 10);
+  setTimeout(() => { toast.classList.remove('show'); setTimeout(() => toast.remove(), 300); }, 3000);
 }
 
 // ============ UTILITIES ============
@@ -595,6 +907,9 @@ function avatarColor(name) {
 }
 
 function formatTime(isoString) {
-  const d = new Date(isoString);
-  return d.toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' });
+  return new Date(isoString).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' });
+}
+
+function escapeHtml(str) {
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }

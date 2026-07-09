@@ -283,8 +283,8 @@ class WebRTCManager {
     });
 
     // Yeni biri katıldı - onlar bize teklif gönderecek, bekliyoruz
-    this.socket.on('user-joined-voice', ({ socketId, username }) => {
-      if (this.onParticipantJoined) this.onParticipantJoined(socketId, username);
+    this.socket.on('user-joined-voice', ({ socketId, username, avatar }) => {
+      if (this.onParticipantJoined) this.onParticipantJoined(socketId, username, avatar);
     });
 
     // Biri ayrıldı
