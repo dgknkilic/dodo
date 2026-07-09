@@ -573,7 +573,8 @@ html, body {
   position: relative;
   flex: 1;
   min-width: 320px;
-  max-height: 100%;
+  max-width: 100%;
+  aspect-ratio: 16 / 9;
 }
 
 .screen-share-item video {
@@ -581,6 +582,7 @@ html, body {
   height: 100%;
   object-fit: contain;
   border-radius: 4px;
+  background: #000;
 }
 
 .screen-share-label {

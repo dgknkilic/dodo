@@ -24,6 +24,7 @@ class WebRTCManager {
     this.onParticipantLeft = null;
     this.onScreenShareStart = null;
     this.onScreenShareStop = null;
+    this.onLocalScreenShareStop = null; // kendi paylaşımım (tarayıcının "durdur" çubuğu dahil) bittiğinde
 
     this.iceConfig = {
       iceServers: [
@@ -197,6 +198,7 @@ class WebRTCManager {
 
     this.isSharing = false;
     this.socket.emit('screen-share-stopped', { channelId: this.currentChannel });
+    if (this.onLocalScreenShareStop) this.onLocalScreenShareStop();
   }
 
   // Yeni peer bağlantısı oluştur

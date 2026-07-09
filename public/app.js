@@ -143,6 +143,7 @@ async function initApp() {
     showScreenShare(socketId, stream, uname || uData?.username);
   };
   webrtc.onScreenShareStop = (socketId) => hideScreenShare(socketId);
+  webrtc.onLocalScreenShareStop = () => hideScreenShare('me');
 
   socket.on('voice-state', (state) => { voiceStates = state; renderChannels(); });
   socket.on('voice-room-update', ({ channelId, participants }) => {
@@ -731,8 +732,13 @@ document.getElementById('vbar-screen').addEventListener('click', toggleScreenSha
 async function toggleScreenShare() {
   if (!webrtc) return;
   try {
-    if (webrtc.isSharing) { webrtc.stopScreenShare(); updateScreenBtn(false); }
-    else { await webrtc.startScreenShare(); updateScreenBtn(true); }
+    if (webrtc.isSharing) {
+      webrtc.stopScreenShare();
+    } else {
+      await webrtc.startScreenShare();
+      showScreenShare('me', webrtc.screenStream, username);
+      updateScreenBtn(true);
+    }
   } catch (err) { if (!err.message.includes('iptal')) alert(err.message); updateScreenBtn(false); }
 }
 
