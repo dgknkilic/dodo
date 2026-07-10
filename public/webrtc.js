@@ -22,12 +22,19 @@ class WebRTCManager {
     this.peerVolumes = {};           // socketId -> 0-2, kişiye özel ses seviyesi
     this.peerAudioNodes = {};        // socketId -> { source, gainNode }
 
+    // Konuşma tespiti - 'me' dahil her ses kaynağı için bir analyser tutulur
+    this._speakingAnalysers = {};    // socketId ('me' dahil) -> { analyser, data }
+    this.speakingStates = {};        // socketId -> boolean
+    this._speakingLoopId = null;
+    this._SPEAKING_THRESHOLD = 12;   // 0-255 ölçeğinde RMS eşiği
+
     // Callbacks (app.js tarafından set edilir)
     this.onParticipantJoined = null;
     this.onParticipantLeft = null;
     this.onScreenShareStart = null;
     this.onScreenShareStop = null;
     this.onLocalScreenShareStop = null; // kendi paylaşımım (tarayıcının "durdur" çubuğu dahil) bittiğinde
+    this.onSpeakingChange = null;    // (socketId, speaking) => {}
 
     this.iceConfig = {
       iceServers: [
@@ -64,6 +71,9 @@ class WebRTCManager {
       this._micSource = source;
       this.localStream = dest.stream;
 
+      this._setupSpeakingAnalyser('me', this.micGainNode);
+      this._startSpeakingLoop();
+
       this.currentChannel = channelId;
       this.socket.emit('join-voice', channelId);
       return true;
@@ -94,6 +104,10 @@ class WebRTCManager {
       try { source.disconnect(); gainNode.disconnect(); } catch (e) {}
     });
     this.peerAudioNodes = {};
+
+    // Konuşma tespitini durdur
+    this._stopSpeakingLoop();
+    Object.keys(this._speakingAnalysers).forEach(id => this._removeSpeakingAnalyser(id));
 
     // Mikrofonu durdur
     if (this._micSource) { try { this._micSource.disconnect(); } catch (e) {} this._micSource = null; }
@@ -426,6 +440,9 @@ class WebRTCManager {
     gainNode.gain.value = peerVol * this.masterVolume;
     source.connect(gainNode).connect(ctx.destination);
     this.peerAudioNodes[socketId] = { source, gainNode };
+
+    // Konuşma tespiti kişisel ses seviyesinden etkilenmesin diye kaynağı (gainNode öncesi) dinle
+    this._setupSpeakingAnalyser(socketId, source);
   }
 
   _stopRemoteAudio(socketId) {
@@ -433,6 +450,61 @@ class WebRTCManager {
     if (node) {
       try { node.source.disconnect(); node.gainNode.disconnect(); } catch (e) {}
       delete this.peerAudioNodes[socketId];
+    }
+    this._removeSpeakingAnalyser(socketId);
+  }
+
+  // ============ KONUŞMA TESPİTİ ============
+
+  _setupSpeakingAnalyser(id, audioNode) {
+    this._removeSpeakingAnalyser(id);
+    const ctx = this._ensureAudioContext();
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.6;
+    audioNode.connect(analyser);
+    this._speakingAnalysers[id] = { analyser, data: new Uint8Array(analyser.frequencyBinCount) };
+  }
+
+  _removeSpeakingAnalyser(id) {
+    const entry = this._speakingAnalysers[id];
+    if (entry) {
+      try { entry.analyser.disconnect(); } catch (e) {}
+      delete this._speakingAnalysers[id];
+    }
+    if (this.speakingStates[id]) {
+      this.speakingStates[id] = false;
+      if (this.onSpeakingChange) this.onSpeakingChange(id, false);
+    }
+    delete this.speakingStates[id];
+  }
+
+  _startSpeakingLoop() {
+    if (this._speakingLoopId) return;
+    const tick = () => {
+      Object.entries(this._speakingAnalysers).forEach(([id, { analyser, data }]) => {
+        analyser.getByteTimeDomainData(data);
+        let sumSquares = 0;
+        for (let i = 0; i < data.length; i++) {
+          const v = data[i] - 128;
+          sumSquares += v * v;
+        }
+        const rms = Math.sqrt(sumSquares / data.length);
+        const speaking = rms > this._SPEAKING_THRESHOLD && !(id === 'me' && this.isMuted);
+        if (this.speakingStates[id] !== speaking) {
+          this.speakingStates[id] = speaking;
+          if (this.onSpeakingChange) this.onSpeakingChange(id, speaking);
+        }
+      });
+      this._speakingLoopId = requestAnimationFrame(tick);
+    };
+    this._speakingLoopId = requestAnimationFrame(tick);
+  }
+
+  _stopSpeakingLoop() {
+    if (this._speakingLoopId) {
+      cancelAnimationFrame(this._speakingLoopId);
+      this._speakingLoopId = null;
     }
   }
 

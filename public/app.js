@@ -146,6 +146,7 @@ async function initApp() {
   };
   webrtc.onScreenShareStop = (socketId) => hideScreenShare(socketId);
   webrtc.onLocalScreenShareStop = () => hideScreenShare('me');
+  webrtc.onSpeakingChange = (socketId, speaking) => updateSpeakingUI(socketId, speaking);
 
   socket.on('voice-state', (state) => { voiceStates = state; renderChannels(); });
   socket.on('voice-room-update', ({ channelId, participants }) => {
@@ -256,16 +257,19 @@ function createChannelElement(ch) {
       members.forEach(m => {
         const uname = typeof m === 'string' ? m : m.username;
         const avatar = typeof m === 'object' ? m.avatar : null;
+        const sid = typeof m === 'object' ? m.socketId : null;
+        const isSpeaking = sid && webrtc?.speakingStates?.[sid === socket?.id ? 'me' : sid];
         const mi = document.createElement('div');
         mi.className = 'voice-member-item';
         const av = document.createElement('div');
         if (avatar) {
           av.innerHTML = `<img src="${avatar}" alt="${uname}" />`;
-          av.className = 'voice-member-avatar has-img';
+          av.className = `voice-member-avatar has-img${isSpeaking ? ' speaking' : ''}`;
         } else {
-          av.className = `voice-member-avatar avatar-color-${avatarColor(uname)}`;
+          av.className = `voice-member-avatar avatar-color-${avatarColor(uname)}${isSpeaking ? ' speaking' : ''}`;
           av.textContent = uname[0].toUpperCase();
         }
+        if (sid) av.dataset.socketId = sid;
         const mn = document.createElement('span');
         mn.className = 'voice-member-name';
         mn.textContent = uname;
@@ -632,7 +636,8 @@ function createParticipantEl(socketId, uname, avatar, muted, sharing, interactiv
   el.id = `vp-${socketId}`;
 
   const av = document.createElement('div');
-  av.className = `vp-avatar${muted ? ' muted' : ''}${sharing ? ' vp-sharing' : ''}`;
+  const isSpeaking = webrtc?.speakingStates?.[socketId];
+  av.className = `vp-avatar${muted ? ' muted' : ''}${sharing ? ' vp-sharing' : ''}${isSpeaking ? ' speaking' : ''}`;
   if (avatar) {
     av.innerHTML = `<img src="${avatar}" alt="${uname}" />`;
     av.classList.add('has-img');
@@ -685,6 +690,19 @@ function createParticipantEl(socketId, uname, avatar, muted, sharing, interactiv
   }
 
   return el;
+}
+
+// socketId: 'me' ya da gerçek socket.id. Sidebar'daki üye listesinde kendi kaydımız
+// gerçek socket.id ile tutulduğu için 'me' burada gerçek id'ye çevrilir.
+function updateSpeakingUI(socketId, speaking) {
+  const vpEl = document.getElementById(`vp-${socketId}`);
+  if (vpEl) vpEl.querySelector('.vp-avatar')?.classList.toggle('speaking', speaking);
+
+  const realId = socketId === 'me' ? socket?.id : socketId;
+  if (!realId) return;
+  document.querySelectorAll(`.voice-member-avatar[data-socket-id="${realId}"]`).forEach(el => {
+    el.classList.toggle('speaking', speaking);
+  });
 }
 
 function updateVoiceUI() {
