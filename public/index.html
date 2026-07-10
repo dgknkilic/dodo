@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Dodo</title>
-  <link rel="stylesheet" href="/style.css?v=3" />
+  <link rel="stylesheet" href="/style.css?v=4" />
 </head>
 <body>
 
@@ -125,6 +125,14 @@
             <div id="join-voice-area" class="join-voice-area hidden">
               <button id="join-voice-btn" class="join-btn">🎤 Sese Katıl</button>
             </div>
+            <!-- Sesli kanalın metin sohbeti -->
+            <div class="voice-chat">
+              <div id="voice-messages" class="messages"></div>
+              <div class="message-input-row">
+                <input id="voice-message-input" type="text" placeholder="Mesaj yaz..." maxlength="2000" autocomplete="off" />
+                <button id="voice-send-btn">Gönder</button>
+              </div>
+            </div>
           </div>
         </div>
         <div id="voice-controls" class="voice-controls hidden">
@@ -144,6 +152,30 @@
       </div>
 
     </main>
+
+    <!-- Sağ: Çevrimiçi Üyeler -->
+    <aside class="members-sidebar" id="members-sidebar">
+      <div class="members-list" id="members-list"></div>
+    </aside>
+
+  </div>
+</div>
+
+<!-- Özel Mesaj (DM) Modalı -->
+<div id="dm-modal-overlay" class="modal-overlay hidden">
+  <div class="modal-box dm-box">
+    <div class="modal-header">
+      <div class="dm-header-user">
+        <div class="dm-header-avatar" id="dm-header-avatar"></div>
+        <span id="dm-header-name"></span>
+      </div>
+      <button class="modal-close" id="dm-modal-close">✕</button>
+    </div>
+    <div class="dm-body messages" id="dm-messages"></div>
+    <div class="message-input-row dm-input-row">
+      <input id="dm-input" type="text" placeholder="Mesaj yaz..." maxlength="2000" autocomplete="off" />
+      <button id="dm-send-btn">Gönder</button>
+    </div>
   </div>
 </div>
 
@@ -254,7 +286,7 @@
 </div>
 
 <script src="/socket.io/socket.io.js"></script>
-<script src="/webrtc.js?v=3"></script>
-<script src="/app.js?v=3"></script>
+<script src="/webrtc.js?v=4"></script>
+<script src="/app.js?v=4"></script>
 </body>
 </html>

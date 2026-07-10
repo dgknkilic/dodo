@@ -26,6 +26,9 @@ let searchActive = false;
 let allMessages = [];           // for search
 let audioSettings = loadAudioSettings();
 let volumePopoverTarget = null; // { type: 'self'|'user', socketId, uname }
+let onlineUsers = [];           // çevrimiçi kullanıcı listesi (sağ panel)
+let dmUser = null;              // şu an açık DM sohbetindeki karşı taraf { id, username, avatar }
+let unreadDM = {};              // userId -> okunmamış DM sayısı
 
 function loadAudioSettings() {
   try {
@@ -156,13 +159,24 @@ async function initApp() {
       renderVoiceParticipantsFromState(channelId);
     }
   });
-  socket.on('new-message', (msg) => { if (currentChannel?.id == msg.channel_id) appendMessage(msg); });
+  socket.on('new-message', (msg) => {
+    if (currentChannel?.id != msg.channel_id) return;
+    if (currentChannel.type === 'voice') appendVoiceMessage(msg);
+    else appendMessage(msg);
+  });
   socket.on('message-deleted', ({ messageId }) => removeMessageEl(messageId));
   socket.on('channel-cleared', () => {
     document.getElementById('messages').innerHTML = '';
+    document.getElementById('voice-messages').innerHTML = '';
     allMessages = [];
     lastMessageDate = null;
   });
+
+  // Çevrimiçi kullanıcılar (sağ panel)
+  socket.on('online-users', (users) => { onlineUsers = users; renderMembers(); });
+
+  // Gelen özel mesaj (DM)
+  socket.on('dm-message', (msg) => onDMReceived(msg));
   socket.on('user-mute-update', ({ socketId, muted }) => { mutedUsers[socketId] = muted; renderVoiceParticipants(); });
   socket.on('force-leave-voice', () => { leaveVoice(); showToast('Ses kanalından çıkarıldınız.'); });
   socket.on('force-join-voice', async ({ channelId }) => {
@@ -300,6 +314,10 @@ async function selectChannel(ch) {
     showView('voice-view');
     document.getElementById('voice-channel-name').textContent = ch.name;
 
+    // Sesli kanalın metin sohbetini yükle (metin kanallarıyla aynı altyapı)
+    socket.emit('join-channel', ch.id);
+    await loadVoiceMessages(ch.id);
+
     if (voiceChannelId == ch.id) { updateVoiceUI(); return; }
     if (voiceChannelId) leaveVoice();
 
@@ -357,7 +375,8 @@ function appendMessage(msg, scroll = true) {
   if (scroll) scrollMessages();
 }
 
-function createMessageEl(msg) {
+function createMessageEl(msg, opts = {}) {
+  const canReply = opts.allowReply !== false;
   const canDelete = isAdmin || msg.user_id === getCurrentUserId();
 
   const group = document.createElement('div');
@@ -405,12 +424,14 @@ function createMessageEl(msg) {
   const actions = document.createElement('div');
   actions.className = 'msg-actions';
 
-  const replyBtn = document.createElement('button');
-  replyBtn.className = 'msg-action-btn';
-  replyBtn.title = 'Yanıtla';
-  replyBtn.textContent = '↩';
-  replyBtn.addEventListener('click', () => setReply(msg));
-  actions.appendChild(replyBtn);
+  if (canReply) {
+    const replyBtn = document.createElement('button');
+    replyBtn.className = 'msg-action-btn';
+    replyBtn.title = 'Yanıtla';
+    replyBtn.textContent = '↩';
+    replyBtn.addEventListener('click', () => setReply(msg));
+    actions.appendChild(replyBtn);
+  }
 
   if (canDelete) {
     const delBtn = document.createElement('button');
@@ -1082,6 +1103,7 @@ document.getElementById('profile-save-btn').addEventListener('click', async () =
     token = data.token; username = data.username; myAvatar = data.avatar || null;
     localStorage.setItem('token', token); localStorage.setItem('username', username);
     renderUserBar();
+    socket?.emit('profile-changed', { username, avatar: myAvatar });
     document.getElementById('profile-modal-overlay').classList.add('hidden');
   } catch { errorEl.textContent = 'Sunucuya bağlanılamadı'; }
   finally { saveBtn.disabled = false; saveBtn.textContent = 'Kaydet'; }
@@ -1113,6 +1135,194 @@ document.getElementById('move-confirm-btn').addEventListener('click', () => {
   socket.emit('admin-move-voice', { targetSocketId: pendingMoveSocketId, channelId });
   document.getElementById('move-modal-overlay').classList.add('hidden');
   pendingMoveSocketId = null;
+});
+
+// ============ SESLİ KANAL SOHBETİ ============
+
+async function loadVoiceMessages(channelId) {
+  const container = document.getElementById('voice-messages');
+  container.innerHTML = '';
+  try {
+    const res = await fetch(`/api/messages/${channelId}`, { headers: { Authorization: `Bearer ${token}` } });
+    const msgs = await res.json();
+    msgs.forEach(m => appendVoiceMessage(m, false));
+    container.scrollTop = container.scrollHeight;
+  } catch {}
+}
+
+function appendVoiceMessage(msg, scroll = true) {
+  const container = document.getElementById('voice-messages');
+  container.appendChild(createMessageEl(msg, { allowReply: false }));
+  if (scroll) container.scrollTop = container.scrollHeight;
+}
+
+function sendVoiceMessage() {
+  const input = document.getElementById('voice-message-input');
+  const content = input.value.trim();
+  if (!content || !currentChannel || currentChannel.type !== 'voice') return;
+  socket.emit('send-message', { channelId: currentChannel.id, content });
+  input.value = '';
+}
+
+document.getElementById('voice-send-btn').addEventListener('click', sendVoiceMessage);
+document.getElementById('voice-message-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendVoiceMessage(); }
+});
+
+// ============ ÇEVRİMİÇİ ÜYELER (SAĞ PANEL) ============
+
+function renderMembers() {
+  const list = document.getElementById('members-list');
+  if (!list) return;
+  list.innerHTML = '';
+  const myId = getCurrentUserId();
+  const admins = onlineUsers.filter(u => u.is_admin);
+  const members = onlineUsers.filter(u => !u.is_admin);
+
+  const addSection = (title, users) => {
+    if (!users.length) return;
+    const h = document.createElement('div');
+    h.className = 'members-section-header';
+    h.textContent = `${title} — ${users.length}`;
+    list.appendChild(h);
+    users.forEach(u => list.appendChild(createMemberEl(u, myId)));
+  };
+
+  addSection('YÖNETİCİLER', admins);
+  addSection('ÜYELER', members);
+}
+
+function createMemberEl(u, myId) {
+  const el = document.createElement('div');
+  el.className = 'member-item';
+
+  const wrap = document.createElement('div');
+  wrap.className = 'member-avatar-wrap';
+  const av = document.createElement('div');
+  setAvatarEl(av, u.username, u.avatar, 'member-avatar');
+  const dot = document.createElement('span');
+  dot.className = 'member-status-dot';
+  wrap.appendChild(av);
+  wrap.appendChild(dot);
+
+  const name = document.createElement('span');
+  name.className = 'member-name';
+  name.textContent = u.username + (u.id === myId ? ' (sen)' : '') + (u.is_admin ? ' 👑' : '');
+
+  el.appendChild(wrap);
+  el.appendChild(name);
+
+  if (unreadDM[u.id]) {
+    const badge = document.createElement('span');
+    badge.className = 'member-unread';
+    badge.textContent = unreadDM[u.id];
+    el.appendChild(badge);
+  }
+
+  if (u.id !== myId) {
+    el.classList.add('clickable');
+    el.title = 'Özel mesaj gönder';
+    el.addEventListener('click', () => openDM(u));
+  }
+  return el;
+}
+
+// ============ ÖZEL MESAJ (DM) ============
+
+function openDM(user) {
+  dmUser = user;
+  delete unreadDM[user.id];
+  renderMembers();
+  document.getElementById('dm-header-name').textContent = user.username + (user.is_admin ? ' 👑' : '');
+  setAvatarEl(document.getElementById('dm-header-avatar'), user.username, user.avatar, 'dm-header-avatar');
+  document.getElementById('dm-messages').innerHTML = '';
+  document.getElementById('dm-modal-overlay').classList.remove('hidden');
+  document.getElementById('dm-input').focus();
+  loadDM(user.id);
+}
+
+function closeDM() {
+  document.getElementById('dm-modal-overlay').classList.add('hidden');
+  dmUser = null;
+}
+
+async function loadDM(userId) {
+  try {
+    const res = await fetch(`/api/dm/${userId}`, { headers: { Authorization: `Bearer ${token}` } });
+    const data = await res.json();
+    const container = document.getElementById('dm-messages');
+    container.innerHTML = '';
+    (data.messages || []).forEach(m => appendDMMessage(m, false));
+    container.scrollTop = container.scrollHeight;
+  } catch {}
+}
+
+function appendDMMessage(m, scroll = true) {
+  const container = document.getElementById('dm-messages');
+  const group = document.createElement('div');
+  group.className = 'msg-group';
+  const inner = document.createElement('div');
+  inner.className = 'msg-inner';
+  const avatar = document.createElement('div');
+  setAvatarEl(avatar, m.sender_username, m.sender_avatar || null, 'msg-avatar');
+  const body = document.createElement('div');
+  body.className = 'msg-body';
+  const meta = document.createElement('div');
+  meta.className = 'msg-meta';
+  const uname = document.createElement('span');
+  uname.className = 'msg-username';
+  uname.textContent = m.sender_username;
+  const time = document.createElement('span');
+  time.className = 'msg-time';
+  time.textContent = formatTime(m.created_at);
+  meta.appendChild(uname);
+  meta.appendChild(time);
+  const content = document.createElement('div');
+  content.className = 'msg-content';
+  content.textContent = m.content;
+  body.appendChild(meta);
+  body.appendChild(content);
+  inner.appendChild(avatar);
+  inner.appendChild(body);
+  group.appendChild(inner);
+  container.appendChild(group);
+  if (scroll) container.scrollTop = container.scrollHeight;
+}
+
+function onDMReceived(msg) {
+  const myId = getCurrentUserId();
+  const overlay = document.getElementById('dm-modal-overlay');
+  const isOpen = !overlay.classList.contains('hidden');
+  const belongsToOpenConvo = dmUser && isOpen && (
+    (msg.sender_id === dmUser.id && msg.recipient_id === myId) ||
+    (msg.sender_id === myId && msg.recipient_id === dmUser.id)
+  );
+
+  if (belongsToOpenConvo) {
+    appendDMMessage(msg);
+  } else if (msg.recipient_id === myId) {
+    // Başkasından gelen, o an açık olmayan mesaj: bildirim + okunmamış rozeti
+    unreadDM[msg.sender_id] = (unreadDM[msg.sender_id] || 0) + 1;
+    renderMembers();
+    showToast(`💬 ${msg.sender_username}: ${msg.content.slice(0, 40)}`);
+  }
+}
+
+function sendDM() {
+  const input = document.getElementById('dm-input');
+  const content = input.value.trim();
+  if (!content || !dmUser) return;
+  socket.emit('dm-send', { toUserId: dmUser.id, content });
+  input.value = '';
+}
+
+document.getElementById('dm-send-btn').addEventListener('click', sendDM);
+document.getElementById('dm-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendDM(); }
+});
+document.getElementById('dm-modal-close').addEventListener('click', closeDM);
+document.getElementById('dm-modal-overlay').addEventListener('click', (e) => {
+  if (e.target === document.getElementById('dm-modal-overlay')) closeDM();
 });
 
 // ============ TOAST ============

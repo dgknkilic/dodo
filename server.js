@@ -45,6 +45,16 @@ db.exec(`
     FOREIGN KEY(channel_id) REFERENCES channels(id),
     FOREIGN KEY(user_id) REFERENCES users(id)
   );
+
+  CREATE TABLE IF NOT EXISTS dm_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender_id INTEGER NOT NULL,
+    recipient_id INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(sender_id) REFERENCES users(id),
+    FOREIGN KEY(recipient_id) REFERENCES users(id)
+  );
 `);
 
 try { db.exec('ALTER TABLE users ADD COLUMN avatar TEXT DEFAULT NULL'); } catch(e) {}
@@ -198,9 +208,37 @@ app.get('/api/channels/:channelId/info', requireAuth, (req, res) => {
   res.json({ message_count: msgCount, user_count: userCount });
 });
 
+// ============ DIRECT MESSAGES ============
+
+const DM_SELECT = `
+  SELECT dm.id, dm.sender_id, dm.recipient_id, dm.content, dm.created_at,
+         u.username as sender_username, u.avatar as sender_avatar
+  FROM dm_messages dm
+  JOIN users u ON dm.sender_id = u.id
+`;
+
+// Belirli bir kullanıcıyla olan özel mesaj geçmişi
+app.get('/api/dm/:userId', requireAuth, (req, res) => {
+  const other = parseInt(req.params.userId);
+  const me = req.user.id;
+  const messages = db.prepare(
+    `${DM_SELECT} WHERE (dm.sender_id=? AND dm.recipient_id=?) OR (dm.sender_id=? AND dm.recipient_id=?)
+     ORDER BY dm.created_at ASC LIMIT 200`
+  ).all(me, other, other, me);
+  const user = db.prepare('SELECT id, username, avatar, is_admin FROM users WHERE id=?').get(other);
+  res.json({ user, messages });
+});
+
 // ============ SOCKET ============
 
 const voiceRooms = {};
+const onlineUsers = new Map();   // userId -> { id, username, avatar, is_admin }
+const userSockets = new Map();   // userId -> Set(socketId)
+
+function broadcastPresence() {
+  const users = Array.from(onlineUsers.values());
+  io.emit('online-users', users);
+}
 
 io.use((socket, next) => {
   const token = socket.handshake.auth.token;
@@ -219,6 +257,43 @@ io.use((socket, next) => {
 io.on('connection', (socket) => {
   const { id: userId, username } = socket.user;
   console.log(`[+] ${username} bağlandı (${socket.id})`);
+
+  // Presence: çevrimiçi kullanıcı listesine ekle
+  if (!userSockets.has(userId)) userSockets.set(userId, new Set());
+  userSockets.get(userId).add(socket.id);
+  onlineUsers.set(userId, {
+    id: userId, username, avatar: socket.user.avatar || null,
+    is_admin: socket.user.is_admin ? 1 : 0
+  });
+  broadcastPresence();
+
+  // Özel mesaj gönder
+  socket.on('dm-send', ({ toUserId, content }) => {
+    const trimmed = content?.trim();
+    if (!trimmed || trimmed.length > 2000 || !toUserId) return;
+    const result = db.prepare(
+      'INSERT INTO dm_messages (sender_id, recipient_id, content) VALUES (?, ?, ?)'
+    ).run(userId, toUserId, trimmed);
+    const msg = db.prepare(`${DM_SELECT} WHERE dm.id=?`).get(result.lastInsertRowid);
+    // Hem alıcının hem gönderenin tüm sekmelerine ilet
+    const targets = new Set([
+      ...(userSockets.get(toUserId) || []),
+      ...(userSockets.get(userId) || [])
+    ]);
+    targets.forEach(sid => io.to(sid).emit('dm-message', msg));
+  });
+
+  // Profil değişince (avatar/isim) çevrimiçi listeyi tazele
+  socket.on('profile-changed', ({ username: newName, avatar }) => {
+    if (newName) socket.user.username = newName;
+    if (avatar !== undefined) socket.user.avatar = avatar;
+    const entry = onlineUsers.get(userId);
+    if (entry) {
+      entry.username = socket.user.username;
+      entry.avatar = socket.user.avatar || null;
+      broadcastPresence();
+    }
+  });
 
   socket.on('get-voice-state', () => {
     const state = {};
@@ -309,6 +384,17 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     console.log(`[-] ${username} ayrıldı`);
     if (socket.voiceChannel) handleLeaveVoice(socket);
+
+    // Presence: bu sokete ait kaydı sil, kullanıcının başka açık sekmesi yoksa çevrimdışı yap
+    const sockets = userSockets.get(userId);
+    if (sockets) {
+      sockets.delete(socket.id);
+      if (sockets.size === 0) {
+        userSockets.delete(userId);
+        onlineUsers.delete(userId);
+      }
+    }
+    broadcastPresence();
   });
 });
 
