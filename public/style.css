@@ -556,6 +556,199 @@ html, body {
 
 .message-input-row button:hover { background: var(--accent-hover); }
 
+/* Dosya ekleme butonu */
+.attach-btn {
+  padding: 8px 10px !important;
+  background: var(--bg-tertiary) !important;
+  font-size: 18px !important;
+  line-height: 1;
+}
+.attach-btn:hover { background: var(--bg-active) !important; }
+
+/* Composer + ek önizleme */
+.composer { flex-shrink: 0; }
+
+.attach-preview {
+  padding: 8px 20px 0;
+}
+
+.attach-preview-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  max-width: 320px;
+}
+
+.attach-preview-chip img {
+  width: 44px;
+  height: 44px;
+  object-fit: cover;
+  border-radius: 6px;
+  flex-shrink: 0;
+}
+
+.attach-preview-icon { font-size: 24px; }
+
+.attach-preview-name {
+  font-size: 13px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+  min-width: 0;
+}
+
+.attach-preview-remove {
+  background: var(--bg-active);
+  border: none;
+  color: var(--text-secondary);
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.attach-preview-remove:hover { background: var(--danger); color: #fff; }
+
+/* Mesaj eki */
+.msg-attachment { margin-top: 4px; }
+
+.msg-attachment-img {
+  max-width: 360px;
+  max-height: 300px;
+  border-radius: 8px;
+  cursor: pointer;
+  display: block;
+}
+.msg-attachment-img:hover { opacity: 0.92; }
+
+.msg-attachment-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  text-decoration: none;
+  color: var(--text-primary);
+  max-width: 300px;
+}
+.msg-attachment-file:hover { background: var(--bg-hover); }
+.msg-attachment-file .file-icon { font-size: 20px; }
+.msg-attachment-file .file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Resim büyütme (lightbox) */
+.image-viewer {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+  cursor: zoom-out;
+  padding: 32px;
+}
+.image-viewer img { max-width: 95vw; max-height: 95vh; border-radius: 6px; }
+
+/* Emoji tepkileri */
+.msg-reactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+.msg-reactions:empty { margin-top: 0; }
+
+.reaction-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg-tertiary);
+  border: 1px solid transparent;
+  border-radius: 10px;
+  padding: 2px 8px;
+  cursor: pointer;
+  font-size: 14px;
+  transition: background .1s, border-color .1s;
+}
+.reaction-chip:hover { border-color: var(--text-muted); }
+.reaction-chip.mine {
+  background: rgba(88,101,242,0.18);
+  border-color: var(--accent);
+}
+.reaction-count { font-size: 12px; font-weight: 600; color: var(--text-secondary); }
+.reaction-chip.mine .reaction-count { color: var(--accent); }
+
+/* Emoji seçici popover */
+.emoji-picker {
+  position: fixed;
+  z-index: 2100;
+  display: flex;
+  gap: 4px;
+  padding: 8px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+}
+.emoji-option {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: 20px;
+  padding: 4px;
+  border-radius: 6px;
+  line-height: 1;
+}
+.emoji-option:hover { background: var(--bg-active); }
+
+/* Yazıyor göstergesi */
+.typing-indicator {
+  padding: 2px 20px 4px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  font-style: italic;
+  min-height: 20px;
+  flex-shrink: 0;
+}
+
+/* @bahsetme */
+.mention {
+  background: rgba(88,101,242,0.15);
+  color: #c9cdfb;
+  border-radius: 3px;
+  padding: 0 2px;
+  font-weight: 600;
+}
+.mention-self {
+  background: rgba(240,161,50,0.25);
+  color: #f0a132;
+}
+
+/* Kanal okunmamış rozeti */
+.channel-unread {
+  margin-left: auto;
+  background: var(--danger);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
 /* ============ VOICE CHANNEL ============ */
 
 #voice-view {

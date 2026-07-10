@@ -29,6 +29,11 @@ let volumePopoverTarget = null; // { type: 'self'|'user', socketId, uname }
 let onlineUsers = [];           // çevrimiçi kullanıcı listesi (sağ panel)
 let dmUser = null;              // şu an açık DM sohbetindeki karşı taraf { id, username, avatar }
 let unreadDM = {};              // userId -> okunmamış DM sayısı
+let unreadChannels = {};        // channelId -> okunmamış mesaj sayısı
+let typingUsers = {};           // username -> timeout id (yazıyor göstergesi)
+let lastTypingEmit = 0;
+let pendingAttach = { text: null, voice: null }; // { dataUrl, name, isImage }
+const REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🎉', '🔥', '👏'];
 
 function loadAudioSettings() {
   try {
@@ -177,6 +182,33 @@ async function initApp() {
 
   // Gelen özel mesaj (DM)
   socket.on('dm-message', (msg) => onDMReceived(msg));
+
+  // Emoji tepki güncellemesi
+  socket.on('reaction-update', ({ messageId, reactions }) => {
+    document.querySelectorAll(`.msg-reactions[data-msg-id="${messageId}"]`).forEach(row => {
+      renderReactionsInto(row, reactions, messageId);
+    });
+  });
+
+  // Başka kanalda mesaj hareketi (okunmamış rozeti + mention bildirimi)
+  socket.on('channel-activity', ({ channelId, username: fromUser, content }) => {
+    if (fromUser === username) return;
+    if (currentChannel?.id == channelId) return;
+    unreadChannels[channelId] = (unreadChannels[channelId] || 0) + 1;
+    renderChannels();
+    if (content && content.toLowerCase().includes('@' + username.toLowerCase())) {
+      const ch = channels.find(c => c.id == channelId);
+      showToast(`📣 ${fromUser} seni etiketledi${ch ? ' #' + ch.name : ''}: ${content.slice(0, 40)}`);
+    }
+  });
+
+  // "Yazıyor" göstergesi
+  socket.on('user-typing', ({ channelId, username: u }) => {
+    if (currentChannel?.id != channelId || u === username) return;
+    if (typingUsers[u]) clearTimeout(typingUsers[u]);
+    typingUsers[u] = setTimeout(() => { delete typingUsers[u]; renderTyping(); }, 3500);
+    renderTyping();
+  });
   socket.on('user-mute-update', ({ socketId, muted }) => { mutedUsers[socketId] = muted; renderVoiceParticipants(); });
   socket.on('force-leave-voice', () => { leaveVoice(); showToast('Ses kanalından çıkarıldınız.'); });
   socket.on('force-join-voice', async ({ channelId }) => {
@@ -261,6 +293,12 @@ function createChannelElement(ch) {
   name.textContent = ch.name;
   row.appendChild(prefix);
   row.appendChild(name);
+  if (unreadChannels[ch.id]) {
+    const badge = document.createElement('span');
+    badge.className = 'channel-unread';
+    badge.textContent = unreadChannels[ch.id];
+    row.appendChild(badge);
+  }
   item.appendChild(row);
 
   if (ch.type === 'voice') {
@@ -301,6 +339,8 @@ function createChannelElement(ch) {
 
 async function selectChannel(ch) {
   currentChannel = ch;
+  delete unreadChannels[ch.id];
+  clearTyping();
   renderChannels();
 
   if (ch.type === 'text') {
@@ -411,18 +451,39 @@ function createMessageEl(msg, opts = {}) {
   meta.appendChild(uname);
   meta.appendChild(time);
 
-  const content = document.createElement('div');
-  content.className = 'msg-content';
-  content.textContent = msg.content;
-
   body.appendChild(meta);
-  body.appendChild(content);
+
+  if (msg.content) {
+    const content = document.createElement('div');
+    content.className = 'msg-content';
+    renderMessageContent(content, msg.content);
+    body.appendChild(content);
+  }
+
+  // Ek (resim / dosya)
+  if (msg.attachment) body.appendChild(buildAttachmentEl(msg));
+
+  // Emoji tepki satırı
+  const reactionRow = document.createElement('div');
+  reactionRow.className = 'msg-reactions';
+  reactionRow.dataset.msgId = msg.id;
+  renderReactionsInto(reactionRow, msg.reactions || [], msg.id);
+  body.appendChild(reactionRow);
+
   inner.appendChild(avatar);
   inner.appendChild(body);
 
   // Aksiyon butonları (hover'da görünür)
   const actions = document.createElement('div');
   actions.className = 'msg-actions';
+
+  // Emoji tepki ekle butonu
+  const reactBtn = document.createElement('button');
+  reactBtn.className = 'msg-action-btn';
+  reactBtn.title = 'Tepki ver';
+  reactBtn.textContent = '😀';
+  reactBtn.addEventListener('click', (e) => { e.stopPropagation(); openEmojiPicker(e.currentTarget, msg.id); });
+  actions.appendChild(reactBtn);
 
   if (canReply) {
     const replyBtn = document.createElement('button');
@@ -465,14 +526,21 @@ function scrollMessages() {
 document.getElementById('message-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 });
+document.getElementById('message-input').addEventListener('input', emitTyping);
 document.getElementById('send-btn').addEventListener('click', sendMessage);
 
 function sendMessage() {
   const input = document.getElementById('message-input');
   const content = input.value.trim();
-  if (!content || !currentChannel) return;
-  socket.emit('send-message', { channelId: currentChannel.id, content, replyToId });
+  const att = pendingAttach.text;
+  if ((!content && !att) || !currentChannel) return;
+  socket.emit('send-message', {
+    channelId: currentChannel.id, content, replyToId,
+    attachment: att?.dataUrl, attachmentName: att?.name
+  });
   input.value = '';
+  pendingAttach.text = null;
+  renderAttachPreview('text');
   clearReply();
 }
 
@@ -1137,6 +1205,224 @@ document.getElementById('move-confirm-btn').addEventListener('click', () => {
   pendingMoveSocketId = null;
 });
 
+// ============ MESAJ İÇERİĞİ / MENTION ============
+
+// Metni güvenli şekilde işler, @bahsetmeleri vurgular (kendi adın özel renkte)
+function renderMessageContent(el, text) {
+  el.innerHTML = '';
+  const parts = text.split(/(@[\wçğıöşüÇĞİÖŞÜ.]+)/g);
+  parts.forEach(part => {
+    const m = part.match(/^@([\wçğıöşüÇĞİÖŞÜ.]+)$/);
+    if (m) {
+      const span = document.createElement('span');
+      const isSelf = m[1].toLowerCase() === (username || '').toLowerCase();
+      span.className = 'mention' + (isSelf ? ' mention-self' : '');
+      span.textContent = part;
+      el.appendChild(span);
+    } else if (part) {
+      el.appendChild(document.createTextNode(part));
+    }
+  });
+}
+
+// ============ MESAJ EKİ (RESİM / DOSYA) ============
+
+function buildAttachmentEl(msg) {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg-attachment';
+  const isImage = typeof msg.attachment === 'string' && msg.attachment.startsWith('data:image/');
+  if (isImage) {
+    const img = document.createElement('img');
+    img.src = msg.attachment;
+    img.className = 'msg-attachment-img';
+    img.alt = msg.attachment_name || 'resim';
+    img.addEventListener('click', () => openImageViewer(msg.attachment));
+    wrap.appendChild(img);
+  } else {
+    const a = document.createElement('a');
+    a.href = msg.attachment;
+    a.download = msg.attachment_name || 'dosya';
+    a.className = 'msg-attachment-file';
+    a.innerHTML = `<span class="file-icon">📎</span><span class="file-name"></span>`;
+    a.querySelector('.file-name').textContent = msg.attachment_name || 'dosya';
+    wrap.appendChild(a);
+  }
+  return wrap;
+}
+
+// Resim büyütme (lightbox)
+function openImageViewer(src) {
+  let overlay = document.getElementById('image-viewer');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'image-viewer';
+    overlay.className = 'image-viewer hidden';
+    overlay.innerHTML = '<img />';
+    overlay.addEventListener('click', () => overlay.classList.add('hidden'));
+    document.body.appendChild(overlay);
+  }
+  overlay.querySelector('img').src = src;
+  overlay.classList.remove('hidden');
+}
+
+// ============ EMOJI TEPKİLERİ ============
+
+function renderReactionsInto(row, reactions, msgId) {
+  row.innerHTML = '';
+  const myId = getCurrentUserId();
+  (reactions || []).forEach(r => {
+    const chip = document.createElement('button');
+    chip.className = 'reaction-chip' + (r.users.includes(myId) ? ' mine' : '');
+    chip.innerHTML = `<span>${r.emoji}</span><span class="reaction-count">${r.count}</span>`;
+    chip.addEventListener('click', () => socket.emit('toggle-reaction', { messageId: msgId, emoji: r.emoji }));
+    row.appendChild(chip);
+  });
+}
+
+function openEmojiPicker(anchorEl, msgId) {
+  let picker = document.getElementById('emoji-picker');
+  if (!picker) {
+    picker = document.createElement('div');
+    picker.id = 'emoji-picker';
+    picker.className = 'emoji-picker hidden';
+    document.body.appendChild(picker);
+    document.addEventListener('click', (e) => {
+      if (!picker.contains(e.target) && !e.target.closest('.msg-action-btn')) picker.classList.add('hidden');
+    });
+  }
+  picker.innerHTML = '';
+  REACTION_EMOJIS.forEach(emoji => {
+    const btn = document.createElement('button');
+    btn.className = 'emoji-option';
+    btn.textContent = emoji;
+    btn.addEventListener('click', () => {
+      socket.emit('toggle-reaction', { messageId: msgId, emoji });
+      picker.classList.add('hidden');
+    });
+    picker.appendChild(btn);
+  });
+  const rect = anchorEl.getBoundingClientRect();
+  picker.classList.remove('hidden');
+  const pw = picker.offsetWidth || 240;
+  let left = rect.left;
+  if (left + pw > window.innerWidth - 8) left = window.innerWidth - pw - 8;
+  picker.style.left = `${Math.max(8, left)}px`;
+  picker.style.top = `${Math.max(8, rect.top - picker.offsetHeight - 6)}px`;
+}
+
+// ============ DOSYA EKLEME (COMPOSER) ============
+
+function setupAttachComposer(kind) {
+  const btn = document.getElementById(`${kind}-attach-btn`);
+  const input = document.getElementById(`${kind}-attach-input`);
+  if (!btn || !input) return;
+  btn.addEventListener('click', () => input.click());
+  input.addEventListener('change', () => {
+    const file = input.files[0];
+    if (file) handleAttachFile(kind, file);
+    input.value = '';
+  });
+}
+
+function handleAttachFile(kind, file) {
+  const isImage = file.type.startsWith('image/');
+  if (isImage) {
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const img = new Image();
+      img.onload = () => {
+        // Büyük resimleri ölçekle (en fazla 1400px), boyutu makul tut
+        const max = 1400;
+        let { width, height } = img;
+        if (width > max || height > max) {
+          const ratio = Math.min(max / width, max / height);
+          width = Math.round(width * ratio); height = Math.round(height * ratio);
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width; canvas.height = height;
+        canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+        pendingAttach[kind] = { dataUrl, name: file.name, isImage: true };
+        renderAttachPreview(kind);
+      };
+      img.src = ev.target.result;
+    };
+    reader.readAsDataURL(file);
+  } else {
+    if (file.size > 6 * 1024 * 1024) { showToast('Dosya çok büyük (en fazla 6MB).'); return; }
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      pendingAttach[kind] = { dataUrl: ev.target.result, name: file.name, isImage: false };
+      renderAttachPreview(kind);
+    };
+    reader.readAsDataURL(file);
+  }
+}
+
+function renderAttachPreview(kind) {
+  const box = document.getElementById(`${kind}-attach-preview`);
+  const att = pendingAttach[kind];
+  if (!att) { box.classList.add('hidden'); box.innerHTML = ''; return; }
+  box.classList.remove('hidden');
+  box.innerHTML = '';
+  const chip = document.createElement('div');
+  chip.className = 'attach-preview-chip';
+  if (att.isImage) {
+    const img = document.createElement('img');
+    img.src = att.dataUrl;
+    chip.appendChild(img);
+  } else {
+    const icon = document.createElement('span');
+    icon.className = 'attach-preview-icon';
+    icon.textContent = '📎';
+    chip.appendChild(icon);
+  }
+  const name = document.createElement('span');
+  name.className = 'attach-preview-name';
+  name.textContent = att.name;
+  chip.appendChild(name);
+  const remove = document.createElement('button');
+  remove.className = 'attach-preview-remove';
+  remove.textContent = '✕';
+  remove.addEventListener('click', () => { pendingAttach[kind] = null; renderAttachPreview(kind); });
+  chip.appendChild(remove);
+  box.appendChild(chip);
+}
+
+setupAttachComposer('text');
+setupAttachComposer('voice');
+
+// ============ YAZIYOR GÖSTERGESİ ============
+
+function emitTyping() {
+  if (!currentChannel) return;
+  const now = Date.now();
+  if (now - lastTypingEmit > 1500) {
+    socket.emit('typing', { channelId: currentChannel.id });
+    lastTypingEmit = now;
+  }
+}
+
+function renderTyping() {
+  const names = Object.keys(typingUsers);
+  let text = '';
+  if (names.length === 1) text = `${names[0]} yazıyor…`;
+  else if (names.length === 2) text = `${names[0]} ve ${names[1]} yazıyor…`;
+  else if (names.length > 2) text = `${names.length} kişi yazıyor…`;
+  ['text-typing', 'voice-typing'].forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = text;
+    el.classList.toggle('hidden', !text);
+  });
+}
+
+function clearTyping() {
+  Object.values(typingUsers).forEach(t => clearTimeout(t));
+  typingUsers = {};
+  renderTyping();
+}
+
 // ============ SESLİ KANAL SOHBETİ ============
 
 async function loadVoiceMessages(channelId) {
@@ -1159,15 +1445,22 @@ function appendVoiceMessage(msg, scroll = true) {
 function sendVoiceMessage() {
   const input = document.getElementById('voice-message-input');
   const content = input.value.trim();
-  if (!content || !currentChannel || currentChannel.type !== 'voice') return;
-  socket.emit('send-message', { channelId: currentChannel.id, content });
+  const att = pendingAttach.voice;
+  if ((!content && !att) || !currentChannel || currentChannel.type !== 'voice') return;
+  socket.emit('send-message', {
+    channelId: currentChannel.id, content,
+    attachment: att?.dataUrl, attachmentName: att?.name
+  });
   input.value = '';
+  pendingAttach.voice = null;
+  renderAttachPreview('voice');
 }
 
 document.getElementById('voice-send-btn').addEventListener('click', sendVoiceMessage);
 document.getElementById('voice-message-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendVoiceMessage(); }
 });
+document.getElementById('voice-message-input').addEventListener('input', emitTyping);
 
 // ============ ÇEVRİMİÇİ ÜYELER (SAĞ PANEL) ============
 

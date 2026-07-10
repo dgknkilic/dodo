@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Dodo</title>
-  <link rel="stylesheet" href="/style.css?v=4" />
+  <link rel="stylesheet" href="/style.css?v=5" />
 </head>
 <body>
 
@@ -106,9 +106,16 @@
           <button id="reply-bar-close">✕</button>
         </div>
 
-        <div class="message-input-row">
-          <input id="message-input" type="text" placeholder="Mesaj yaz..." maxlength="2000" autocomplete="off" />
-          <button id="send-btn">Gönder</button>
+        <div id="text-typing" class="typing-indicator hidden"></div>
+
+        <div class="composer">
+          <div id="text-attach-preview" class="attach-preview hidden"></div>
+          <div class="message-input-row">
+            <button class="attach-btn" id="text-attach-btn" title="Dosya/Resim ekle">📎</button>
+            <input type="file" id="text-attach-input" accept="image/*,.pdf,.txt,.zip,.doc,.docx,.xls,.xlsx" hidden />
+            <input id="message-input" type="text" placeholder="Mesaj yaz..." maxlength="2000" autocomplete="off" />
+            <button id="send-btn">Gönder</button>
+          </div>
         </div>
       </div>
 
@@ -128,9 +135,15 @@
             <!-- Sesli kanalın metin sohbeti -->
             <div class="voice-chat">
               <div id="voice-messages" class="messages"></div>
-              <div class="message-input-row">
-                <input id="voice-message-input" type="text" placeholder="Mesaj yaz..." maxlength="2000" autocomplete="off" />
-                <button id="voice-send-btn">Gönder</button>
+              <div id="voice-typing" class="typing-indicator hidden"></div>
+              <div class="composer">
+                <div id="voice-attach-preview" class="attach-preview hidden"></div>
+                <div class="message-input-row">
+                  <button class="attach-btn" id="voice-attach-btn" title="Dosya/Resim ekle">📎</button>
+                  <input type="file" id="voice-attach-input" accept="image/*,.pdf,.txt,.zip,.doc,.docx,.xls,.xlsx" hidden />
+                  <input id="voice-message-input" type="text" placeholder="Mesaj yaz..." maxlength="2000" autocomplete="off" />
+                  <button id="voice-send-btn">Gönder</button>
+                </div>
               </div>
             </div>
           </div>
@@ -286,7 +299,7 @@
 </div>
 
 <script src="/socket.io/socket.io.js"></script>
-<script src="/webrtc.js?v=4"></script>
-<script src="/app.js?v=4"></script>
+<script src="/webrtc.js?v=5"></script>
+<script src="/app.js?v=5"></script>
 </body>
 </html>

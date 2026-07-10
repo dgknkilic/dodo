@@ -55,11 +55,24 @@ db.exec(`
     FOREIGN KEY(sender_id) REFERENCES users(id),
     FOREIGN KEY(recipient_id) REFERENCES users(id)
   );
+
+  CREATE TABLE IF NOT EXISTS reactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    emoji TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(message_id, user_id, emoji),
+    FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  );
 `);
 
 try { db.exec('ALTER TABLE users ADD COLUMN avatar TEXT DEFAULT NULL'); } catch(e) {}
 try { db.exec('ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0'); } catch(e) {}
 try { db.exec('ALTER TABLE messages ADD COLUMN reply_to_id INTEGER DEFAULT NULL'); } catch(e) {}
+try { db.exec('ALTER TABLE messages ADD COLUMN attachment TEXT DEFAULT NULL'); } catch(e) {}
+try { db.exec('ALTER TABLE messages ADD COLUMN attachment_name TEXT DEFAULT NULL'); } catch(e) {}
 
 db.prepare('UPDATE users SET is_admin=1 WHERE id=(SELECT MIN(id) FROM users) AND (SELECT COUNT(*) FROM users WHERE is_admin=1)=0').run();
 
@@ -163,6 +176,7 @@ app.get('/api/channels', requireAuth, (req, res) => {
 
 const MSG_SELECT = `
   SELECT m.id, m.channel_id, m.content, m.created_at, m.reply_to_id,
+         m.attachment, m.attachment_name,
          u.username, u.id as user_id, u.avatar,
          ru.username as reply_username,
          rm.content as reply_content
@@ -172,8 +186,30 @@ const MSG_SELECT = `
   LEFT JOIN users ru ON rm.user_id = ru.id
 `;
 
+// Bir grup mesaj için tepkileri toplulaştır: messageId -> [{ emoji, count, users:[userId] }]
+function getReactionsForMessages(messageIds) {
+  const map = {};
+  if (!messageIds.length) return map;
+  const placeholders = messageIds.map(() => '?').join(',');
+  const rows = db.prepare(
+    `SELECT message_id, emoji, user_id FROM reactions WHERE message_id IN (${placeholders}) ORDER BY created_at ASC`
+  ).all(...messageIds);
+  rows.forEach(r => {
+    if (!map[r.message_id]) map[r.message_id] = {};
+    if (!map[r.message_id][r.emoji]) map[r.message_id][r.emoji] = [];
+    map[r.message_id][r.emoji].push(r.user_id);
+  });
+  const result = {};
+  Object.entries(map).forEach(([mid, emojis]) => {
+    result[mid] = Object.entries(emojis).map(([emoji, users]) => ({ emoji, count: users.length, users }));
+  });
+  return result;
+}
+
 app.get('/api/messages/:channelId', requireAuth, (req, res) => {
   const messages = db.prepare(`${MSG_SELECT} WHERE m.channel_id = ? ORDER BY m.created_at ASC LIMIT 100`).all(req.params.channelId);
+  const reactions = getReactionsForMessages(messages.map(m => m.id));
+  messages.forEach(m => { m.reactions = reactions[m.id] || []; });
   res.json(messages);
 });
 
@@ -311,16 +347,45 @@ io.on('connection', (socket) => {
     socket.join(`text:${channelId}`);
   });
 
-  socket.on('send-message', ({ channelId, content, replyToId }) => {
-    const trimmed = content?.trim();
-    if (!trimmed || trimmed.length > 2000) return;
+  socket.on('send-message', ({ channelId, content, replyToId, attachment, attachmentName }) => {
+    const trimmed = (content || '').trim();
+    if (trimmed.length > 2000) return;
+    // İçerik ya da ek olmalı
+    const hasAttachment = typeof attachment === 'string' && attachment.length > 0;
+    if (!trimmed && !hasAttachment) return;
+    // Ek boyut sınırı (~8MB data URL)
+    if (hasAttachment && attachment.length > 8 * 1024 * 1024) return;
 
     const result = db.prepare(
-      'INSERT INTO messages (channel_id, user_id, content, reply_to_id) VALUES (?, ?, ?, ?)'
-    ).run(channelId, userId, trimmed, replyToId || null);
+      'INSERT INTO messages (channel_id, user_id, content, reply_to_id, attachment, attachment_name) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(channelId, userId, trimmed, replyToId || null, hasAttachment ? attachment : null, hasAttachment ? (attachmentName || 'dosya') : null);
 
     const msg = db.prepare(`${MSG_SELECT} WHERE m.id = ?`).get(result.lastInsertRowid);
+    msg.reactions = [];
     io.to(`text:${channelId}`).emit('new-message', msg);
+    // Diğer kanallardaki kullanıcılar okunmamış rozeti görsün diye herkese hafif bildirim
+    io.emit('channel-activity', { channelId: Number(channelId), messageId: msg.id, username });
+  });
+
+  // Emoji tepkisi ekle/kaldır (toggle)
+  socket.on('toggle-reaction', ({ messageId, emoji }) => {
+    if (!messageId || !emoji || emoji.length > 8) return;
+    const msg = db.prepare('SELECT channel_id FROM messages WHERE id=?').get(messageId);
+    if (!msg) return;
+    const existing = db.prepare('SELECT id FROM reactions WHERE message_id=? AND user_id=? AND emoji=?').get(messageId, userId, emoji);
+    if (existing) {
+      db.prepare('DELETE FROM reactions WHERE id=?').run(existing.id);
+    } else {
+      db.prepare('INSERT INTO reactions (message_id, user_id, emoji) VALUES (?, ?, ?)').run(messageId, userId, emoji);
+    }
+    const reactions = getReactionsForMessages([messageId])[messageId] || [];
+    io.to(`text:${msg.channel_id}`).emit('reaction-update', { messageId, reactions });
+  });
+
+  // "Yazıyor" göstergesi
+  socket.on('typing', ({ channelId }) => {
+    if (!channelId) return;
+    socket.to(`text:${channelId}`).emit('user-typing', { channelId: Number(channelId), username });
   });
 
   socket.on('join-voice', (channelId) => {
