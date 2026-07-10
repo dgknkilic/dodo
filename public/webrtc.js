@@ -1,9 +1,12 @@
 'use strict';
 
+console.log('[WebRTC] webrtc.js v3 yüklendi (ayrı ses/ekran paylaşım bağlantıları)');
+
 class WebRTCManager {
   constructor(socket) {
     this.socket = socket;
-    this.peers = {};           // socketId -> RTCPeerConnection
+    this.peers = {};           // socketId -> RTCPeerConnection (sadece mikrofon)
+    this.sharePeers = {};      // socketId -> RTCPeerConnection (sadece ekran paylaşım videosu, ses bağlantısından bağımsız)
     this.rawMicStream = null;  // ham mikrofon stream (donanımdan gelen)
     this.localStream = null;   // kazanç uygulanmış, peer'lara gönderilen stream
     this.screenStream = null;  // ekran paylaşım stream
@@ -79,9 +82,12 @@ class WebRTCManager {
 
     this.socket.emit('leave-voice');
 
-    // Tüm peer bağlantılarını kapat
+    // Tüm ses bağlantılarını kapat
     Object.values(this.peers).forEach(pc => pc.close());
     this.peers = {};
+
+    // Tüm ekran paylaşım bağlantılarını kapat
+    this._closeAllSharePeers();
 
     // Gelen ses düğümlerini temizle
     Object.values(this.peerAudioNodes).forEach(({ source, gainNode }) => {
@@ -146,7 +152,11 @@ class WebRTCManager {
     return this.isMuted;
   }
 
-  // Ekran paylaşımını başlat
+  // ============ EKRAN PAYLAŞIMI ============
+  // Ekran paylaşımı, mikrofon bağlantısından tamamen ayrı, kendine özel
+  // RTCPeerConnection'lar (sharePeers) üzerinden yürür. Bu sayede ses ve video
+  // aynı bağlantıda renegotiation çakışmasına (m-line sırası hatası) girmez.
+
   async startScreenShare() {
     if (this.isSharing) return;
     try {
@@ -156,21 +166,14 @@ class WebRTCManager {
       });
 
       const videoTrack = this.screenStream.getVideoTracks()[0];
-
-      // Tüm peer bağlantılarına video track ekle (renegotiation tetikler)
-      for (const [socketId, pc] of Object.entries(this.peers)) {
-        const videoSender = pc.getSenders().find(s => s.track?.kind === 'video');
-        if (videoSender) {
-          await videoSender.replaceTrack(videoTrack);
-        } else {
-          pc.addTrack(videoTrack, this.screenStream);
-        }
-      }
-
       videoTrack.onended = () => this.stopScreenShare();
 
       this.isSharing = true;
       this.socket.emit('screen-share-started', { channelId: this.currentChannel });
+
+      // Sesli kanalda şu an bağlı olan herkese ayrı bir video bağlantısı aç
+      Object.keys(this.peers).forEach(socketId => this._sendShareOfferTo(socketId));
+
       return true;
     } catch (err) {
       console.error('Ekran paylaşım hatası:', err);
@@ -181,7 +184,6 @@ class WebRTCManager {
     }
   }
 
-  // Ekran paylaşımını durdur
   stopScreenShare() {
     if (!this.isSharing) return;
 
@@ -190,18 +192,132 @@ class WebRTCManager {
       this.screenStream = null;
     }
 
-    // Video track'i peer bağlantılarından kaldır
-    for (const pc of Object.values(this.peers)) {
-      const videoSender = pc.getSenders().find(s => s.track?.kind === 'video');
-      if (videoSender) pc.removeTrack(videoSender);
-    }
+    this._closeAllSharePeers();
 
     this.isSharing = false;
     this.socket.emit('screen-share-stopped', { channelId: this.currentChannel });
     if (this.onLocalScreenShareStop) this.onLocalScreenShareStop();
   }
 
-  // Yeni peer bağlantısı oluştur
+  // Belirli bir kullanıcıya kendi ekran paylaşım videomu göndermek için yeni bağlantı kur
+  async _sendShareOfferTo(socketId) {
+    if (!this.screenStream) return;
+    console.log('[WebRTC/Share] teklif gönderiliyor ->', socketId);
+    try {
+      const pc = this._createSharePeerConnection(socketId);
+      const videoTrack = this.screenStream.getVideoTracks()[0];
+      if (!videoTrack) return;
+      pc.addTrack(videoTrack, this.screenStream);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      this.socket.emit('webrtc-offer', {
+        to: socketId,
+        offer: pc.localDescription,
+        channelId: this.currentChannel,
+        kind: 'share'
+      });
+      console.log('[WebRTC/Share] teklif gönderildi ->', socketId);
+    } catch (err) {
+      console.error('[WebRTC/Share] Ekran paylaşım teklifi hatası:', err);
+    }
+  }
+
+  _createSharePeerConnection(socketId) {
+    const existing = this.sharePeers[socketId];
+    if (existing) { try { existing.close(); } catch (e) {} }
+
+    const pc = new RTCPeerConnection(this.iceConfig);
+
+    pc.ontrack = (event) => {
+      console.log('[WebRTC/Share] ontrack:', socketId, event.track.kind, 'muted=', event.track.muted);
+      if (event.track.kind !== 'video') return;
+      const track = event.track;
+      const stream = event.streams[0];
+      track.onunmute = () => {
+        console.log('[WebRTC/Share] video unmute:', socketId);
+        if (this.onScreenShareStart) this.onScreenShareStart(socketId, stream);
+      };
+      track.onended = () => {
+        if (this.onScreenShareStop) this.onScreenShareStop(socketId);
+      };
+      if (!track.muted) {
+        if (this.onScreenShareStart) this.onScreenShareStart(socketId, stream);
+      }
+    };
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        this.socket.emit('webrtc-ice', { to: socketId, candidate: event.candidate, kind: 'share' });
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      console.log('[WebRTC/Share] connectionState:', socketId, pc.connectionState);
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        delete this.sharePeers[socketId];
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log('[WebRTC/Share] iceConnectionState:', socketId, pc.iceConnectionState);
+    };
+
+    this.sharePeers[socketId] = pc;
+    return pc;
+  }
+
+  async _handleShareOffer(from, offer) {
+    console.log('[WebRTC/Share] teklif alındı <-', from);
+    try {
+      const pc = this._createSharePeerConnection(from);
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      this.socket.emit('webrtc-answer', { to: from, answer: pc.localDescription, kind: 'share' });
+      console.log('[WebRTC/Share] cevap gönderildi ->', from);
+    } catch (err) {
+      console.error('[WebRTC/Share] Ekran paylaşım cevabı hatası:', err);
+    }
+  }
+
+  async _handleShareAnswer(from, answer) {
+    console.log('[WebRTC/Share] cevap alındı <-', from);
+    const pc = this.sharePeers[from];
+    if (!pc) { console.warn('[WebRTC/Share] cevap için sharePeer bulunamadı:', from); return; }
+    try {
+      if (pc.signalingState === 'have-local-offer') {
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      }
+    } catch (err) {
+      console.error('Ekran paylaşım cevabı işleme hatası:', err);
+    }
+  }
+
+  async _handleShareICE(from, candidate) {
+    const pc = this.sharePeers[from];
+    if (!pc || !candidate) return;
+    try {
+      await pc.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch (err) {
+      // ICE state hatası genellikle zararsızdır
+    }
+  }
+
+  _closeSharePeer(socketId) {
+    const pc = this.sharePeers[socketId];
+    if (pc) {
+      pc.close();
+      delete this.sharePeers[socketId];
+    }
+  }
+
+  _closeAllSharePeers() {
+    Object.keys(this.sharePeers).forEach(id => this._closeSharePeer(id));
+  }
+
+  // ============ MİKROFON (SES) BAĞLANTILARI ============
+
+  // Yeni peer bağlantısı oluştur (sadece mikrofon sesi taşır)
   _createPeerConnection(socketId) {
     const pc = new RTCPeerConnection(this.iceConfig);
 
@@ -212,24 +328,10 @@ class WebRTCManager {
       });
     }
 
-    // Gelen track'leri işle
+    // Gelen ses track'ini işle
     pc.ontrack = (event) => {
-      const track = event.track;
-      const stream = event.streams[0];
-
-      if (track.kind === 'audio') {
-        this._playRemoteAudio(socketId, stream);
-      } else if (track.kind === 'video') {
-        // Ekran paylaşımı
-        track.onunmute = () => {
-          if (this.onScreenShareStart) this.onScreenShareStart(socketId, stream);
-        };
-        track.onended = () => {
-          if (this.onScreenShareStop) this.onScreenShareStop(socketId);
-        };
-        if (!track.muted) {
-          if (this.onScreenShareStart) this.onScreenShareStart(socketId, stream);
-        }
+      if (event.track.kind === 'audio') {
+        this._playRemoteAudio(socketId, event.streams[0]);
       }
     };
 
@@ -237,21 +339,6 @@ class WebRTCManager {
     pc.onicecandidate = (event) => {
       if (event.candidate) {
         this.socket.emit('webrtc-ice', { to: socketId, candidate: event.candidate });
-      }
-    };
-
-    // Renegotiation (ekran paylaşımı başlayınca tetiklenir)
-    pc.onnegotiationneeded = async () => {
-      try {
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        this.socket.emit('webrtc-offer', {
-          to: socketId,
-          offer: pc.localDescription,
-          channelId: this.currentChannel
-        });
-      } catch (err) {
-        console.error('Renegotiation hatası:', err);
       }
     };
 
@@ -284,12 +371,19 @@ class WebRTCManager {
 
   // Gelen teklifi işle
   async _handleOffer(from, offer) {
-    const pc = this._createPeerConnection(from);
+    const isNewPeer = !this.peers[from];
+    const pc = this.peers[from] || this._createPeerConnection(from);
     try {
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       this.socket.emit('webrtc-answer', { to: from, answer: pc.localDescription });
+
+      // Yeni katılan biriyle ses bağlantısı kurulduysa ve ben şu an ekran paylaşıyorsam,
+      // ona da ayrı bir video bağlantısı aç
+      if (isNewPeer && this.isSharing) {
+        this._sendShareOfferTo(from);
+      }
     } catch (err) {
       console.error('Cevap oluşturma hatası:', err);
     }
@@ -363,29 +457,35 @@ class WebRTCManager {
         this.peers[socketId].close();
         delete this.peers[socketId];
       }
+      this._closeSharePeer(socketId);
       this._stopRemoteAudio(socketId);
       delete this.peerVolumes[socketId];
       if (this.onParticipantLeft) this.onParticipantLeft(socketId);
     });
 
-    // WebRTC sinyalleşme
-    this.socket.on('webrtc-offer', async ({ from, offer }) => {
-      await this._handleOffer(from, offer);
+    // WebRTC sinyalleşme - "kind" alanına göre ses ya da ekran paylaşım bağlantısına yönlendir
+    this.socket.on('webrtc-offer', async ({ from, offer, kind }) => {
+      if (kind === 'share') await this._handleShareOffer(from, offer);
+      else await this._handleOffer(from, offer);
     });
 
-    this.socket.on('webrtc-answer', async ({ from, answer }) => {
-      await this._handleAnswer(from, answer);
+    this.socket.on('webrtc-answer', async ({ from, answer, kind }) => {
+      if (kind === 'share') await this._handleShareAnswer(from, answer);
+      else await this._handleAnswer(from, answer);
     });
 
-    this.socket.on('webrtc-ice', async ({ from, candidate }) => {
-      await this._handleICE(from, candidate);
+    this.socket.on('webrtc-ice', async ({ from, candidate, kind }) => {
+      if (kind === 'share') await this._handleShareICE(from, candidate);
+      else await this._handleICE(from, candidate);
     });
 
-    // Ekran paylaşım bildirimleri
+    // Ekran paylaşım bildirimleri (gerçek video bağlantısından önce/bağımsız gelen bildirim)
     this.socket.on('screen-share-update', ({ socketId, username, sharing }) => {
+      console.log('[WebRTC/Share] screen-share-update:', socketId, username, 'sharing=', sharing);
       if (sharing) {
         if (this.onScreenShareStart) this.onScreenShareStart(socketId, null, username);
       } else {
+        this._closeSharePeer(socketId);
         if (this.onScreenShareStop) this.onScreenShareStop(socketId);
       }
     });

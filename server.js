@@ -287,14 +287,14 @@ io.on('connection', (socket) => {
     targetSocket.emit('force-join-voice', { channelId });
   });
 
-  socket.on('webrtc-offer', ({ to, offer, channelId }) => {
-    io.to(to).emit('webrtc-offer', { from: socket.id, fromUsername: username, offer, channelId });
+  socket.on('webrtc-offer', ({ to, offer, channelId, kind }) => {
+    io.to(to).emit('webrtc-offer', { from: socket.id, fromUsername: username, offer, channelId, kind });
   });
-  socket.on('webrtc-answer', ({ to, answer }) => {
-    io.to(to).emit('webrtc-answer', { from: socket.id, answer });
+  socket.on('webrtc-answer', ({ to, answer, kind }) => {
+    io.to(to).emit('webrtc-answer', { from: socket.id, answer, kind });
   });
-  socket.on('webrtc-ice', ({ to, candidate }) => {
-    io.to(to).emit('webrtc-ice', { from: socket.id, candidate });
+  socket.on('webrtc-ice', ({ to, candidate, kind }) => {
+    io.to(to).emit('webrtc-ice', { from: socket.id, candidate, kind });
   });
   socket.on('screen-share-started', ({ channelId }) => {
     socket.to(`voice:${channelId}`).emit('screen-share-update', { socketId: socket.id, username, sharing: true });

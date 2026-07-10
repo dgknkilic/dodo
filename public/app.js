@@ -14,6 +14,8 @@ let voiceParticipants = {};     // socketId -> {username, avatar}
 let voiceStates = {};           // channelId -> [{socketId, username, avatar}]
 let mutedUsers = {};
 let sharingUsers = {};
+let activeShares = {};          // socketId -> { uname, stream }
+let watchingShareId = null;     // şu an oynatıcıda izlenen paylaşımın socketId'si
 let currentTab = 'login';
 let lastMessageDate = null;
 let replyToId = null;
@@ -759,6 +761,8 @@ function leaveVoice() {
   voiceParticipants = {};
   mutedUsers = {};
   sharingUsers = {};
+  activeShares = {};
+  watchingShareId = null;
   document.getElementById('screen-shares').innerHTML = '';
   document.getElementById('screen-shares').classList.add('hidden');
   updateScreenBtn(false);
@@ -863,34 +867,119 @@ function hideVoiceBar() {
 }
 
 function showScreenShare(socketId, stream, uname) {
-  const container = document.getElementById('screen-shares');
-  container.classList.remove('hidden');
-  let item = document.getElementById(`ss-${socketId}`);
-  if (!item) {
-    item = document.createElement('div');
-    item.className = 'screen-share-item';
-    item.id = `ss-${socketId}`;
-    const video = document.createElement('video');
-    video.autoplay = true; video.playsInline = true; video.muted = (socketId === 'me');
-    const label = document.createElement('div');
-    label.className = 'screen-share-label';
-    label.textContent = `🖥️ ${uname || username}`;
-    item.appendChild(video); item.appendChild(label);
-    container.appendChild(item);
-  }
-  if (stream) item.querySelector('video').srcObject = stream;
+  const existing = activeShares[socketId];
+  activeShares[socketId] = { uname: uname || existing?.uname || username, stream: stream || existing?.stream || null };
   sharingUsers[socketId] = true;
+
+  // Kendi paylaşımını her zaman otomatik göster; başkalarınınki "Katıl" bekler
+  if (socketId === 'me' && watchingShareId === null) watchingShareId = 'me';
+
+  renderShareStage();
   renderVoiceParticipants();
 }
 
 function hideScreenShare(socketId) {
-  const item = document.getElementById(`ss-${socketId}`);
-  if (item) item.remove();
-  const container = document.getElementById('screen-shares');
-  if (!container.children.length) container.classList.add('hidden');
+  delete activeShares[socketId];
   delete sharingUsers[socketId];
+  if (watchingShareId === socketId) watchingShareId = null;
+  if (socketId === 'me') updateScreenBtn(false);
+  renderShareStage();
   renderVoiceParticipants();
-  updateScreenBtn(false);
+}
+
+function watchShare(socketId) {
+  watchingShareId = socketId;
+  renderShareStage();
+}
+
+function renderShareStage() {
+  const container = document.getElementById('screen-shares');
+  container.innerHTML = '';
+  const ids = Object.keys(activeShares);
+  if (!ids.length) {
+    container.classList.add('hidden');
+    return;
+  }
+  container.classList.remove('hidden');
+
+  if (watchingShareId && activeShares[watchingShareId]) {
+    const { uname, stream } = activeShares[watchingShareId];
+    const player = document.createElement('div');
+    player.className = 'share-player';
+
+    const header = document.createElement('div');
+    header.className = 'share-player-header';
+
+    const title = document.createElement('span');
+    title.className = 'share-player-title';
+    title.textContent = watchingShareId === 'me' ? 'Kendi paylaşımın' : `🖥️ ${uname}`;
+    header.appendChild(title);
+
+    const fsBtn = document.createElement('button');
+    fsBtn.className = 'share-player-btn';
+    fsBtn.textContent = '⛶ Tam Ekran';
+    fsBtn.addEventListener('click', () => {
+      if (!document.fullscreenElement) player.requestFullscreen?.();
+      else document.exitFullscreen?.();
+    });
+    header.appendChild(fsBtn);
+
+    if (watchingShareId !== 'me') {
+      const leaveBtn = document.createElement('button');
+      leaveBtn.className = 'share-player-btn';
+      leaveBtn.textContent = 'İzlemeyi Bırak';
+      leaveBtn.addEventListener('click', () => { watchingShareId = null; renderShareStage(); });
+      header.appendChild(leaveBtn);
+    }
+
+    player.appendChild(header);
+
+    if (stream) {
+      const video = document.createElement('video');
+      video.autoplay = true;
+      video.playsInline = true;
+      video.muted = (watchingShareId === 'me');
+      video.srcObject = stream;
+      player.appendChild(video);
+    } else {
+      const waiting = document.createElement('div');
+      waiting.className = 'share-player-waiting';
+      waiting.textContent = 'Yayına bağlanılıyor...';
+      player.appendChild(waiting);
+    }
+
+    container.appendChild(player);
+  }
+
+  const others = ids.filter(id => id !== watchingShareId);
+  if (others.length) {
+    const prompts = document.createElement('div');
+    prompts.className = 'share-prompts';
+    others.forEach(id => {
+      const { uname } = activeShares[id];
+      const card = document.createElement('div');
+      card.className = 'share-prompt-card';
+
+      const icon = document.createElement('div');
+      icon.className = 'share-prompt-icon';
+      icon.textContent = '🖥️';
+
+      const text = document.createElement('div');
+      text.className = 'share-prompt-text';
+      text.innerHTML = id === 'me' ? `<strong>Kendi yayınına</strong> dön` : `<strong>${uname}</strong> ekran paylaşıyor`;
+
+      const btn = document.createElement('button');
+      btn.className = 'share-join-btn';
+      btn.textContent = id === 'me' ? 'Dön' : 'Katıl';
+      btn.addEventListener('click', () => watchShare(id));
+
+      card.appendChild(icon);
+      card.appendChild(text);
+      card.appendChild(btn);
+      prompts.appendChild(card);
+    });
+    container.appendChild(prompts);
+  }
 }
 
 // ============ PROFİL MODALI ============

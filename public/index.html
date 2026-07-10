@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Dodo</title>
-  <link rel="stylesheet" href="/style.css" />
+  <link rel="stylesheet" href="/style.css?v=3" />
 </head>
 <body>
 
@@ -118,10 +118,14 @@
           <span class="view-header-icon">🔊</span>
           <span id="voice-channel-name"></span>
         </div>
-        <div id="screen-shares" class="screen-shares hidden"></div>
-        <div id="voice-participants" class="voice-participants"></div>
-        <div id="join-voice-area" class="join-voice-area hidden">
-          <button id="join-voice-btn" class="join-btn">🎤 Sese Katıl</button>
+        <div class="voice-body">
+          <div id="voice-participants" class="voice-participants"></div>
+          <div class="voice-stage">
+            <div id="screen-shares" class="screen-shares hidden"></div>
+            <div id="join-voice-area" class="join-voice-area hidden">
+              <button id="join-voice-btn" class="join-btn">🎤 Sese Katıl</button>
+            </div>
+          </div>
         </div>
         <div id="voice-controls" class="voice-controls hidden">
           <button id="mute-btn" class="ctrl-btn active">
@@ -250,7 +254,7 @@
 </div>
 
 <script src="/socket.io/socket.io.js"></script>
-<script src="/webrtc.js"></script>
-<script src="/app.js"></script>
+<script src="/webrtc.js?v=3"></script>
+<script src="/app.js?v=3"></script>
 </body>
 </html>
